@@ -64,6 +64,38 @@ def test_delta_state_builder_produces_fixed_slots_for_variable_history():
     assert not torch.allclose(tokens[0], tokens[1])
 
 
+def test_delta_state_builder_uses_trainable_memory_projections():
+    builder = DeltaStateHistoryMemoryBuilder(
+        compressor_model_name="fake",
+        memory_hidden_size=6,
+        compressor=FakeCompressor(),
+        delta_rank=3,
+        delta_memory_slots=2,
+        delta_seed=7,
+    )
+
+    parameter_names = {name for name, _ in builder.named_parameters()}
+
+    assert parameter_names == {
+        "W_q.weight",
+        "W_k.weight",
+        "W_v.weight",
+        "W_beta.weight",
+        "W_beta.bias",
+        "slot_queries",
+    }
+    assert all(parameter.requires_grad for parameter in builder.parameters())
+
+    x = torch.arange(1, 13, dtype=torch.float32).reshape(2, 6)
+    q, k, v, beta = builder._project_to_memory(x)
+
+    assert q.shape == (2, 3)
+    assert k.shape == (2, 3)
+    assert v.shape == (2, 6)
+    assert beta.shape == (2, 3)
+    assert builder._tokens_to_state_memory(x).shape == (2, 6)
+
+
 def test_factory_accepts_delta_state_name():
     builder = make_history_memory_builder(
         memory_builder="delta-state",

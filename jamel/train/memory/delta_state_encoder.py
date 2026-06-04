@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Sequence, TYPE_CHECKING
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
@@ -16,10 +17,6 @@ MODEL_NAME = "JAMEL-DeltaState"
 VALID_MEMORY_BUILDERS = ("online_tokens", "delta_state", "hybrid")
 
 
-def _normalize_rows(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return F.normalize(x.float(), dim=-1, eps=eps)
-
-
 def _as_memory_rows(token: torch.Tensor, *, hidden_size: int) -> torch.Tensor:
     if token.ndim == 1:
         token = token.unsqueeze(0)
@@ -28,14 +25,6 @@ def _as_memory_rows(token: torch.Tensor, *, hidden_size: int) -> torch.Tensor:
             f"Expected memory token rows [N, {hidden_size}], got {tuple(token.shape)}."
         )
     return token.detach().float().cpu()
-
-
-def _projection_matrix(rows: int, cols: int, *, seed: int, scale: float = 1.0) -> torch.Tensor:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed))
-    matrix = torch.randn(rows, cols, generator=generator, dtype=torch.float32)
-    matrix = matrix / max(1.0, float(cols) ** 0.5)
-    return matrix * float(scale)
 
 
 def _to_pil_image(image: Any):
@@ -73,17 +62,19 @@ class DeltaStateMemoryConfig:
             raise ValueError("memory_slots must be >= 1")
 
 
-class DeltaStateHistoryMemoryBuilder:
+class DeltaStateHistoryMemoryBuilder(nn.Module):
     """Build fixed-size memory tokens from a global delta-rule state.
 
     For each historical browser step, we first reuse JAMEL's ScreenCompressor to
-    produce a step embedding x_t. Then we update a value-wide associative state:
+    produce a step embedding x_t. Then trainable memory projections produce
+    low-rank q_t/k_t, full-width v_t, and per-rank beta_t gates. We update a
+    value-wide associative state:
 
         pred_t = S @ k_t
-        S_t = lambda_t * S - beta_t * outer(pred_t, k_t) + beta_t * outer(v_t, k_t)
+        S_t = S * (1 - beta_t) + outer(v_t - pred_t, beta_t * k_t)
 
-    where k_t is a low-rank key and v_t is the step embedding. The final state is
-    read with deterministic slot queries to produce K prefix memory tokens.
+    where k_t is a low-rank key and v_t is the projected step value. The final
+    state is read with trainable slot queries to produce K prefix memory tokens.
     """
 
     builder_name = "delta_state"
@@ -105,6 +96,7 @@ class DeltaStateHistoryMemoryBuilder:
         delta_memory_slots: int | None = None,
         delta_seed: int | None = None,
     ) -> None:
+        super().__init__()
         self.history_window = max(1, int(history_window))
         self.max_memory_items = None if max_memory_items is None else max(1, int(max_memory_items))
         self.history_action_prefix = history_action_prefix
@@ -118,7 +110,7 @@ class DeltaStateHistoryMemoryBuilder:
                 torch_dtype=torch_dtype,
                 device_map=device_map,
             )
-        self.compressor = compressor
+        object.__setattr__(self, "compressor", compressor)
         self.memory_hidden_size = int(self.compressor.hidden_size)
         base_config = delta_config or DeltaStateMemoryConfig()
         self.delta_config = DeltaStateMemoryConfig(
@@ -128,17 +120,54 @@ class DeltaStateHistoryMemoryBuilder:
             beta_bias=base_config.beta_bias,
             value_layer_norm=base_config.value_layer_norm,
         )
-        self._init_fixed_projections()
-
-    def _init_fixed_projections(self) -> None:
         hidden = self.memory_hidden_size
         rank = self.delta_config.rank
-        seed = self.delta_config.seed
-        self.q_proj = _projection_matrix(hidden, rank, seed=seed + 1)
-        self.k_proj = _projection_matrix(hidden, rank, seed=seed + 2)
-        self.beta_proj = _projection_matrix(hidden, 1, seed=seed + 3)
-        slot_queries = _projection_matrix(self.delta_config.memory_slots, rank, seed=seed + 4)
-        self.slot_queries = _normalize_rows(slot_queries)
+        slots = self.delta_config.memory_slots
+        self.W_q = nn.Linear(hidden, rank, bias=False)
+        self.W_k = nn.Linear(hidden, rank, bias=False)
+        self.W_v = nn.Linear(hidden, hidden, bias=False)
+        self.W_beta = nn.Linear(hidden, rank, bias=True)
+        self.slot_queries = nn.Parameter(torch.empty(slots, rank, dtype=torch.float32))
+        self._reset_memory_parameters()
+
+    def _reset_memory_parameters(self) -> None:
+        hidden = self.memory_hidden_size
+        rank = self.delta_config.rank
+        seed = int(self.delta_config.seed)
+
+        def randn_like_parameter(parameter: torch.Tensor, *, local_seed: int, fan_in: int) -> torch.Tensor:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(local_seed)
+            values = torch.randn(parameter.shape, generator=generator, dtype=torch.float32)
+            return values / max(1.0, float(fan_in) ** 0.5)
+
+        with torch.no_grad():
+            self.W_q.weight.copy_(
+                randn_like_parameter(self.W_q.weight, local_seed=seed + 1, fan_in=hidden)
+            )
+            self.W_k.weight.copy_(
+                randn_like_parameter(self.W_k.weight, local_seed=seed + 2, fan_in=hidden)
+            )
+            self.W_v.weight.zero_()
+            self.W_v.weight.diagonal().fill_(1.0)
+            self.W_beta.weight.zero_()
+            self.W_beta.bias.fill_(float(self.delta_config.beta_bias))
+            self.slot_queries.copy_(
+                randn_like_parameter(self.slot_queries, local_seed=seed + 4, fan_in=rank)
+            )
+
+    def _project_to_memory(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project step embeddings into DeltaState q/k/v/beta memory coordinates."""
+        q = F.normalize(torch.tanh(self.W_q(x)), dim=-1, eps=1e-6)
+        k = F.normalize(torch.tanh(self.W_k(x)), dim=-1, eps=1e-6)
+        v = self.W_v(x)
+        if self.delta_config.value_layer_norm:
+            v = F.layer_norm(v, (self.memory_hidden_size,))
+        beta = torch.sigmoid(self.W_beta(x))
+        return q, k, v, beta
 
     def _history_limit(self) -> int:
         limit = self.history_window
@@ -200,16 +229,19 @@ class DeltaStateHistoryMemoryBuilder:
     def _tokens_to_state_memory(self, tokens: torch.Tensor) -> torch.Tensor:
         hidden = self.memory_hidden_size
         rank = self.delta_config.rank
-        state = torch.zeros((hidden, rank), dtype=torch.float32)
+        parameter = self.W_q.weight
+        device = parameter.device
+        dtype = parameter.dtype
+        state = torch.zeros((hidden, rank), dtype=dtype, device=device)
         if tokens.numel() == 0:
-            return torch.zeros((self.delta_config.memory_slots, hidden), dtype=torch.float32)
+            return torch.zeros(
+                (self.delta_config.memory_slots, hidden),
+                dtype=torch.float32,
+                device=device,
+            )
 
-        values = tokens.float()
-        if self.delta_config.value_layer_norm:
-            values = F.layer_norm(values, (hidden,))
-        q_seq = _normalize_rows(values @ self.q_proj)
-        k_seq = _normalize_rows(values @ self.k_proj)
-        beta_seq = torch.sigmoid(values @ self.beta_proj + float(self.delta_config.beta_bias)).squeeze(-1)
+        x_seq = tokens.to(device=device, dtype=dtype)
+        _q_seq, k_seq, values, beta_seq = self._project_to_memory(x_seq)
 
         for idx in range(values.shape[0]):
             k_t = k_seq[idx]
@@ -217,13 +249,9 @@ class DeltaStateHistoryMemoryBuilder:
             beta_t = beta_seq[idx].clamp(0.0, 1.0)
             lambda_t = 1.0 - beta_t
             pred_t = state @ k_t
-            state = (
-                lambda_t * state
-                - beta_t * torch.outer(pred_t, k_t)
-                + beta_t * torch.outer(v_t, k_t)
-            )
+            state = lambda_t.unsqueeze(0) * state + torch.outer(v_t - pred_t, beta_t * k_t)
 
-        memory_tokens = torch.einsum("hr,sr->sh", state, self.slot_queries)
+        memory_tokens = (state @ self.slot_queries.T).T
         source_rms = values.float().pow(2).mean().sqrt().clamp_min(1e-6)
         memory_rms = memory_tokens.float().pow(2).mean().sqrt().clamp_min(1e-6)
         memory_tokens = memory_tokens * (source_rms / memory_rms).clamp(max=1.0)
@@ -239,21 +267,37 @@ class DeltaStateHistoryMemoryBuilder:
             batch_size=batch_size,
             history_records=history_records,
         )
-        memory_tokens = torch.zeros(
-            (batch_size, self.delta_config.memory_slots, self.memory_hidden_size),
-            dtype=torch.float32,
-        )
-        memory_mask = torch.zeros(
-            (batch_size, self.delta_config.memory_slots),
-            dtype=torch.long,
-        )
+        parameter = self.W_q.weight
+        device = parameter.device
+        sample_memory_tokens: list[torch.Tensor] = []
+        sample_memory_masks: list[torch.Tensor] = []
         for sample_idx, rows in enumerate(sample_rows):
             if not rows:
+                sample_memory_tokens.append(
+                    torch.zeros(
+                        (self.delta_config.memory_slots, self.memory_hidden_size),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                )
+                sample_memory_masks.append(
+                    torch.zeros(
+                        (self.delta_config.memory_slots,),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                )
                 continue
             tokens = torch.cat(rows, dim=0)
-            memory_tokens[sample_idx] = self._tokens_to_state_memory(tokens)
-            memory_mask[sample_idx] = 1
-        return memory_tokens, memory_mask
+            sample_memory_tokens.append(self._tokens_to_state_memory(tokens))
+            sample_memory_masks.append(
+                torch.ones(
+                    (self.delta_config.memory_slots,),
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+        return torch.stack(sample_memory_tokens, dim=0), torch.stack(sample_memory_masks, dim=0)
 
 
 class HybridHistoryMemoryBuilder:

@@ -37,3 +37,6 @@ Thumbs.db
 
 # root ignore
 /env/
+
+*.pdf
+FIX_GUIDE.md
