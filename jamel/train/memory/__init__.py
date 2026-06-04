@@ -4,6 +4,9 @@ __all__ = [
     "MemoryTokenSFTDataset",
     "JAMELMemoryVLTokenSFTDataset",
     "OnlineHistoryMemoryBuilder",
+    "DeltaStateHistoryMemoryBuilder",
+    "HybridHistoryMemoryBuilder",
+    "make_history_memory_builder",
 ]
 
 _IMPORTS = {
@@ -12,6 +15,9 @@ _IMPORTS = {
     "MemoryTokenSFTDataset": (".sft_dataset", "MemoryTokenSFTDataset"),
     "JAMELMemoryVLTokenSFTDataset": (".jamel_sft_dataset", "JAMELMemoryVLTokenSFTDataset"),
     "OnlineHistoryMemoryBuilder": (".encoder", "OnlineHistoryMemoryBuilder"),
+    "DeltaStateHistoryMemoryBuilder": (".delta_state_encoder", "DeltaStateHistoryMemoryBuilder"),
+    "HybridHistoryMemoryBuilder": (".delta_state_encoder", "HybridHistoryMemoryBuilder"),
+    "make_history_memory_builder": (".delta_state_encoder", "make_history_memory_builder"),
 }
 
 

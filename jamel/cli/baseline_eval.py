@@ -2004,6 +2004,11 @@ class JAMELMemoryAugAdapter:
         compressor_model: str,
         device: str,
         memory_max_items: int,
+        memory_builder: str = "online_tokens",
+        delta_rank: int = 8,
+        delta_memory_slots: int = 8,
+        delta_seed: int = 13,
+        hybrid_recent_items: int = 32,
     ) -> None:
         if not checkpoint:
             raise ValueError("jamel-memory-aug requires --checkpoint")
@@ -2015,6 +2020,11 @@ class JAMELMemoryAugAdapter:
         self.compressor_model = compressor_model
         self.device = device
         self.memory_max_items = memory_max_items
+        self.memory_builder_type = str(memory_builder).strip().lower().replace("-", "_")
+        self.delta_rank = int(delta_rank)
+        self.delta_memory_slots = int(delta_memory_slots)
+        self.delta_seed = int(delta_seed)
+        self.hybrid_recent_items = int(hybrid_recent_items)
         self._loaded = False
         self._history_records: list[dict[str, Any]] = []
 
@@ -2023,7 +2033,7 @@ class JAMELMemoryAugAdapter:
             return
         import torch
         from transformers import AutoProcessor
-        from jamel.train.memory.encoder import OnlineHistoryMemoryBuilder
+        from jamel.train.memory.delta_state_encoder import make_history_memory_builder
         from jamel.train.memory.modeling import MemoryAugmentedCausalLM
 
         self.torch = torch
@@ -2041,7 +2051,8 @@ class JAMELMemoryAugAdapter:
             self.memory_hidden_size = int(mem_cfg.get("memory_hidden_size", 2048))
         else:
             self.memory_hidden_size = 2048
-        self.memory_builder = OnlineHistoryMemoryBuilder(
+        self.memory_builder = make_history_memory_builder(
+            memory_builder=self.memory_builder_type,
             compressor_model_name=self.compressor_model,
             memory_hidden_size=self.memory_hidden_size,
             history_window=self.memory_max_items,
@@ -2049,6 +2060,10 @@ class JAMELMemoryAugAdapter:
             torch_dtype="bfloat16",
             device_map=self.device,
             cache_history_memory=True,
+            delta_rank=self.delta_rank,
+            delta_memory_slots=self.delta_memory_slots,
+            delta_seed=self.delta_seed,
+            hybrid_recent_items=self.hybrid_recent_items,
         )
         compressor = self.memory_builder.compressor
         tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
@@ -2100,6 +2115,9 @@ class JAMELMemoryAugAdapter:
                 "response_has_think": bool(think),
                 "checkpoint": self.checkpoint,
                 "memory_max_items": self.memory_max_items,
+                "memory_builder": self.memory_builder_type,
+                "delta_rank": self.delta_rank,
+                "delta_memory_slots": self.delta_memory_slots,
             },
         )
 
@@ -2284,6 +2302,11 @@ def build_agent(
             compressor_model=args.compressor_model,
             device=args.device,
             memory_max_items=args.memory_max_items,
+            memory_builder=args.memory_builder,
+            delta_rank=args.delta_rank,
+            delta_memory_slots=args.delta_memory_slots,
+            delta_seed=args.delta_seed,
+            hybrid_recent_items=args.hybrid_recent_items,
         )
     raise ValueError(f"Unsupported baseline agent: {agent_name}")
 
@@ -3087,6 +3110,15 @@ def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     parser.add_argument("--compressor-model", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--memory-max-items", type=int, default=512)
+    parser.add_argument(
+        "--memory-builder",
+        choices=["online_tokens", "delta_state", "hybrid"],
+        default=os.environ.get("MEMORY_BUILDER", "online_tokens"),
+    )
+    parser.add_argument("--delta-rank", type=int, default=int(os.environ.get("DELTA_RANK", "8")))
+    parser.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))
+    parser.add_argument("--delta-seed", type=int, default=int(os.environ.get("DELTA_SEED", "13")))
+    parser.add_argument("--hybrid-recent-items", type=int, default=int(os.environ.get("HYBRID_RECENT_ITEMS", "32")))
     parser.add_argument("--monocart-html-report", action="store_true")
     return parser
 

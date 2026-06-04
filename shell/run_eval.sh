@@ -145,6 +145,12 @@ WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}
 PORT_BASE=${PORT_BASE:-8800}
 TEMPERATURE=${TEMPERATURE:-0.8}
 TOP_P=${TOP_P:-0.9}
+MEMORY_MAX_ITEMS=${MEMORY_MAX_ITEMS:-512}
+MEMORY_BUILDER=${MEMORY_BUILDER:-online_tokens}
+DELTA_RANK=${DELTA_RANK:-8}
+DELTA_MEMORY_SLOTS=${DELTA_MEMORY_SLOTS:-8}
+DELTA_SEED=${DELTA_SEED:-13}
+HYBRID_RECENT_ITEMS=${HYBRID_RECENT_ITEMS:-32}
 APPS_MODE=${APPS_MODE:-test10}
 SCALEWOB_ROOT=${SCALEWOB_ROOT:-"$JAMEL_ROOT/env/browser_env/scalewob-env"}
 APP_CONFIG=${APP_CONFIG:-"$JAMEL_ROOT/configs/benchmark_apps.json"}
@@ -320,6 +326,8 @@ echo "  total workers:   $TOTAL_WORKERS"
 echo "  sessions:        $NUM_SESSIONS per app"
 echo "  max_steps:       $MAX_STEPS per session (agent may reset() to start new episodes)"
 echo "  sampling:        temperature=$TEMPERATURE  top_p=$TOP_P"
+echo "  memory builder:  $MEMORY_BUILDER"
+echo "  delta state:     rank=$DELTA_RANK slots=$DELTA_MEMORY_SLOTS seed=$DELTA_SEED hybrid_recent=$HYBRID_RECENT_ITEMS"
 echo "  scalewob_root:   $SCALEWOB_ROOT"
 if [[ -n "${JAMEL_BASE_MODEL:-}" ]]; then
     echo "  base model:      $JAMEL_BASE_MODEL"
@@ -362,7 +370,12 @@ for ((w=0; w<TOTAL_WORKERS; w++)); do
         --gpu-id            0 \
         --max-steps         "$MAX_STEPS" \
         --num-sessions      "$NUM_SESSIONS" \
-        --memory-max-items  512 \
+        --memory-max-items  "$MEMORY_MAX_ITEMS" \
+        --memory-builder    "$MEMORY_BUILDER" \
+        --delta-rank        "$DELTA_RANK" \
+        --delta-memory-slots "$DELTA_MEMORY_SLOTS" \
+        --delta-seed        "$DELTA_SEED" \
+        --hybrid-recent-items "$HYBRID_RECENT_ITEMS" \
         --output            "$EVAL_OUTPUT" \
         --port              "$PORT" \
         --temperature       "$TEMPERATURE" \
@@ -422,6 +435,9 @@ agg = {
     'checkpoint': "$CHECKPOINT",
     'app_source': "$APP_SOURCE",
     'prompt_format': 'web_prompt',
+    'memory_builder': "$MEMORY_BUILDER",
+    'delta_rank': int("$DELTA_RANK"),
+    'delta_memory_slots': int("$DELTA_MEMORY_SLOTS"),
     'max_steps_per_session': $MAX_STEPS,
     'sessions_per_app': $NUM_SESSIONS,
     'total_apps': len(results),

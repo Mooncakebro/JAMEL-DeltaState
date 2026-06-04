@@ -195,10 +195,15 @@ class MemoryAugAgent:
                  temperature: float = 0.8, top_p: float = 0.9,
                  model_image_size: tuple[int, int] | None = None,
                  max_input_tokens: int = 8192,
-                 max_new_tokens: int = 256):
+                 max_new_tokens: int = 256,
+                 memory_builder: str = "online_tokens",
+                 delta_rank: int = 8,
+                 delta_memory_slots: int = 8,
+                 delta_seed: int = 13,
+                 hybrid_recent_items: int = 32):
         from transformers import AutoProcessor
         from jamel.train.memory.modeling import MemoryAugmentedCausalLM
-        from jamel.train.memory.encoder import OnlineHistoryMemoryBuilder
+        from jamel.train.memory.delta_state_encoder import MODEL_NAME, make_history_memory_builder
         from jamel.train.memory.web_prompt import WEB_MODEL_IMAGE_SIZE
 
         print(f"[model] Loading MemoryAugmentedCausalLM from {checkpoint} ...")
@@ -241,6 +246,11 @@ class MemoryAugAgent:
         self.model_image_size = model_image_size if model_image_size is not None else WEB_MODEL_IMAGE_SIZE
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
+        self.memory_builder_type = str(memory_builder).strip().lower().replace("-", "_")
+        self.delta_rank = int(delta_rank)
+        self.delta_memory_slots = int(delta_memory_slots)
+        self.delta_seed = int(delta_seed)
+        self.hybrid_recent_items = int(hybrid_recent_items)
         print(f"[model] eval image size aligned to {self.model_image_size[0]}x{self.model_image_size[1]} (resize before processor)")
 
         mem_cfg_path = Path(checkpoint) / "memory_augment_config.json"
@@ -249,9 +259,14 @@ class MemoryAugAgent:
             self.memory_hidden_size = mem_cfg.get("memory_hidden_size", 2048)
         else:
             self.memory_hidden_size = 2048
-        print(f"[model] memory_hidden_size={self.memory_hidden_size}, memory_max_items={memory_max_items}")
+        print(
+            f"[model] memory_hidden_size={self.memory_hidden_size}, memory_max_items={memory_max_items}, "
+            f"memory_builder={self.memory_builder_type}, delta_rank={self.delta_rank}, "
+            f"delta_slots={self.delta_memory_slots}"
+        )
 
-        self.memory_builder = OnlineHistoryMemoryBuilder(
+        self.memory_builder = make_history_memory_builder(
+            memory_builder=self.memory_builder_type,
             compressor_model_name=compressor_model,
             memory_hidden_size=self.memory_hidden_size,
             history_window=memory_max_items,
@@ -259,7 +274,13 @@ class MemoryAugAgent:
             torch_dtype="bfloat16",
             device_map=device,
             cache_history_memory=True,
+            delta_rank=self.delta_rank,
+            delta_memory_slots=self.delta_memory_slots,
+            delta_seed=self.delta_seed,
+            hybrid_recent_items=self.hybrid_recent_items,
         )
+        if self.memory_builder_type == "delta_state":
+            print(f"[model] using {MODEL_NAME}")
         compressor = self.memory_builder.compressor
         tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
         if tokenizer is not None:
@@ -521,6 +542,11 @@ def run_session(args: argparse.Namespace, agent: "MemoryAugAgent | None" = None)
             model_image_size=(args.model_image_width, args.model_image_height),
             max_input_tokens=args.max_input_tokens,
             max_new_tokens=args.max_new_tokens,
+            memory_builder=getattr(args, "memory_builder", "online_tokens"),
+            delta_rank=getattr(args, "delta_rank", 8),
+            delta_memory_slots=getattr(args, "delta_memory_slots", 8),
+            delta_seed=getattr(args, "delta_seed", 13),
+            hybrid_recent_items=getattr(args, "hybrid_recent_items", 32),
         )
     agent.reset_session()
 
@@ -808,6 +834,11 @@ def run_all_apps(args: argparse.Namespace) -> None:
         model_image_size=(args.model_image_width, args.model_image_height),
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
+        memory_builder=getattr(args, "memory_builder", "online_tokens"),
+        delta_rank=getattr(args, "delta_rank", 8),
+        delta_memory_slots=getattr(args, "delta_memory_slots", 8),
+        delta_seed=getattr(args, "delta_seed", 13),
+        hybrid_recent_items=getattr(args, "hybrid_recent_items", 32),
     )
 
     all_results = []
@@ -899,6 +930,9 @@ def run_all_apps(args: argparse.Namespace) -> None:
     agg_path.write_text(json.dumps({
         "checkpoint": args.checkpoint,
         "prompt_format": "web_prompt",
+        "memory_builder": args.memory_builder,
+        "delta_rank": args.delta_rank,
+        "delta_memory_slots": args.delta_memory_slots,
         "max_steps_per_session": args.max_steps,
         "sessions_per_app": num_sessions,
         "total_apps": len(all_results),
@@ -928,6 +962,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--num-sessions", type=int, default=1, help="Independent sessions to run per app")
     p.add_argument("--memory-max-items", type=int, default=512)
+    p.add_argument(
+        "--memory-builder",
+        choices=["online_tokens", "delta_state", "hybrid"],
+        default=os.environ.get("MEMORY_BUILDER", "online_tokens"),
+        help="History compressor for memory tokens. delta_state selects JAMEL-DeltaState.",
+    )
+    p.add_argument("--delta-rank", type=int, default=int(os.environ.get("DELTA_RANK", "8")))
+    p.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))
+    p.add_argument("--delta-seed", type=int, default=int(os.environ.get("DELTA_SEED", "13")))
+    p.add_argument("--hybrid-recent-items", type=int, default=int(os.environ.get("HYBRID_RECENT_ITEMS", "32")))
     p.add_argument("--output", default=str(_REPO_ROOT / "outputs" / "eval_trajectory"))
     p.add_argument("--device", default="cuda")
     p.add_argument("--port", type=int, default=8790, help="Local HTTP port for ScaleWoB")

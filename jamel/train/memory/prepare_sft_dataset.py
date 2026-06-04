@@ -65,7 +65,7 @@ def _get_screenshot(row) -> bytes | None:
 
 def build_dataset(args: argparse.Namespace) -> None:
     from jamel.core.env.web.axtree_utils import prune_axtree
-    from jamel.train.memory.encoder import OnlineHistoryMemoryBuilder
+    from jamel.train.memory.delta_state_encoder import MODEL_NAME, make_history_memory_builder
     from jamel.train.memory.web_prompt import (
         build_web_prompt,
         extract_axtree_from_observation_str,
@@ -173,7 +173,8 @@ def build_dataset(args: argparse.Namespace) -> None:
         raise RuntimeError("No valid specs found.")
 
     # ── Compress memory tokens (in session order → max cache reuse) ──────────
-    builder = OnlineHistoryMemoryBuilder(
+    builder = make_history_memory_builder(
+        memory_builder=args.memory_builder,
         compressor_model_name=args.compressor_model,
         memory_hidden_size=args.memory_hidden_size,
         # history_window: upper bound on records passed; use max_memory_items
@@ -184,12 +185,20 @@ def build_dataset(args: argparse.Namespace) -> None:
         torch_dtype="bfloat16",
         device_map="auto",
         cache_history_memory=True,
+        delta_rank=args.delta_rank,
+        delta_memory_slots=args.delta_memory_slots,
+        delta_seed=args.delta_seed,
+        hybrid_recent_items=args.hybrid_recent_items,
     )
     compressor = builder.compressor
     tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
     if tokenizer is not None:
         tokenizer.add_eos_token = True
-    print(f"Memory hidden size: {builder.memory_hidden_size}  max_memory_items: {args.max_memory_items}")
+    print(
+        f"Memory builder: {args.memory_builder} ({MODEL_NAME if args.memory_builder == 'delta_state' else 'JAMEL'})  "
+        f"hidden_size: {builder.memory_hidden_size}  max_memory_items: {args.max_memory_items}  "
+        f"delta_rank: {args.delta_rank}  delta_slots: {args.delta_memory_slots}"
+    )
 
     finalized_rows: list[dict[str, Any]] = []
     batch_size = args.compression_batch_size
@@ -250,6 +259,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", required=True, help="Output directory")
     p.add_argument("--compressor-model", required=True, help="Local Qwen3-VL-2B compressor model directory")
     p.add_argument("--memory-hidden-size", default="auto")
+    p.add_argument(
+        "--memory-builder",
+        choices=["online_tokens", "delta_state", "hybrid"],
+        default="online_tokens",
+        help="History compressor used to produce memory_tokens. delta_state is JAMEL-DeltaState.",
+    )
+    p.add_argument("--delta-rank", type=int, default=8, help="JAMEL-DeltaState associative rank.")
+    p.add_argument("--delta-memory-slots", type=int, default=8, help="Number of state-derived memory tokens.")
+    p.add_argument("--delta-seed", type=int, default=13, help="Deterministic projection seed for JAMEL-DeltaState.")
+    p.add_argument(
+        "--hybrid-recent-items",
+        type=int,
+        default=32,
+        help="For memory_builder=hybrid, append this many recent original JAMEL tokens after DeltaState tokens.",
+    )
     p.add_argument(
         "--max-memory-items", type=int, default=512,
         help="Maximum number of history steps to keep in memory.  "
