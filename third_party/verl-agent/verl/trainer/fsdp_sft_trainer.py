@@ -404,17 +404,30 @@ class FSDPSFTTrainer:
         loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
         memory_tokens = batch.get("memory_tokens")
         memory_attention_mask = batch.get("memory_attention_mask")
+        history_memory_tokens = batch.get("history_memory_tokens")
+        history_memory_attention_mask = batch.get("history_memory_attention_mask")
+        current_memory_query_tokens = batch.get("current_memory_query_tokens")
+        current_memory_query_attention_mask = batch.get("current_memory_query_attention_mask")
         # multi_modal_inputs is passed as a kwarg to avoid TensorDict batch-dim validation
         if multi_modal_inputs is None:
             multi_modal_inputs = batch.get("multi_modal_inputs")
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
-        if memory_tokens is not None and use_sp:
-            raise ValueError("memory_tokens are not supported with remove padding / sequence parallel SFT.")
+        has_online_delta_state = history_memory_tokens is not None
+        if (memory_tokens is not None or has_online_delta_state) and use_sp:
+            raise ValueError("memory inputs are not supported with remove padding / sequence parallel SFT.")
         if memory_tokens is not None:
             memory_tokens = memory_tokens.to(self.device_name)
             if memory_attention_mask is not None:
                 memory_attention_mask = memory_attention_mask.to(self.device_name)
+        if history_memory_tokens is not None:
+            history_memory_tokens = history_memory_tokens.to(self.device_name)
+            if history_memory_attention_mask is not None:
+                history_memory_attention_mask = history_memory_attention_mask.to(self.device_name)
+        if current_memory_query_tokens is not None:
+            current_memory_query_tokens = current_memory_query_tokens.to(self.device_name)
+            if current_memory_query_attention_mask is not None:
+                current_memory_query_attention_mask = current_memory_query_attention_mask.to(self.device_name)
         if multi_modal_inputs is not None:
             multi_modal_inputs = {
                 key: value.to(self.device_name) if isinstance(value, torch.Tensor) else value
@@ -435,6 +448,10 @@ class FSDPSFTTrainer:
                     position_ids=position_ids,
                     memory_tokens=memory_tokens,
                     memory_attention_mask=memory_attention_mask,
+                    history_memory_tokens=history_memory_tokens,
+                    history_memory_attention_mask=history_memory_attention_mask,
+                    current_memory_query_tokens=current_memory_query_tokens,
+                    current_memory_query_attention_mask=current_memory_query_attention_mask,
                     use_cache=False,
                     **multi_modal_inputs,
                 )
@@ -443,8 +460,10 @@ class FSDPSFTTrainer:
                 # If memory tokens were prepended as a prefix, the logits include
                 # extra positions for those prefix tokens.  Strip them so that
                 # logits and labels have the same sequence length.
-                if memory_tokens is not None:
+                prefix_len = int(getattr(output, "memory_prefix_length", 0) or 0)
+                if prefix_len <= 0 and memory_tokens is not None:
                     prefix_len = memory_tokens.shape[1]
+                if prefix_len > 0:
                     logits = logits[:, prefix_len:, :]
 
                 shift_logits = logits[..., :-1, :].contiguous()

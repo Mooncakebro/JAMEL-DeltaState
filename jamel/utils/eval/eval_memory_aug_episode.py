@@ -259,14 +259,18 @@ class MemoryAugAgent:
             self.memory_hidden_size = mem_cfg.get("memory_hidden_size", 2048)
         else:
             self.memory_hidden_size = 2048
+        self.use_online_delta_state = getattr(self.model, "delta_state_memory", None) is not None
+        builder_type = self.memory_builder_type
+        if self.use_online_delta_state and builder_type not in {"delta_state", "online_delta_state"}:
+            builder_type = "online_delta_state"
         print(
             f"[model] memory_hidden_size={self.memory_hidden_size}, memory_max_items={memory_max_items}, "
-            f"memory_builder={self.memory_builder_type}, delta_rank={self.delta_rank}, "
+            f"memory_builder={builder_type}, delta_rank={self.delta_rank}, "
             f"delta_slots={self.delta_memory_slots}"
         )
 
         self.memory_builder = make_history_memory_builder(
-            memory_builder=self.memory_builder_type,
+            memory_builder=builder_type,
             compressor_model_name=compressor_model,
             memory_hidden_size=self.memory_hidden_size,
             history_window=memory_max_items,
@@ -279,7 +283,8 @@ class MemoryAugAgent:
             delta_seed=self.delta_seed,
             hybrid_recent_items=self.hybrid_recent_items,
         )
-        if self.memory_builder_type == "delta_state":
+        self.memory_builder_type = builder_type
+        if self.memory_builder_type in {"delta_state", "online_delta_state"}:
             print(f"[model] using {MODEL_NAME}")
         compressor = self.memory_builder.compressor
         tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
@@ -293,12 +298,33 @@ class MemoryAugAgent:
         self._history_records = []
         self._session_step_idx = 0
 
-    def _build_memory_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_memory_inputs(self, *, current_image: Image.Image | None = None) -> dict[str, torch.Tensor]:
+        if self.use_online_delta_state:
+            history_tokens, history_mask = self.memory_builder.build_step_token_inputs(
+                batch_size=1,
+                history_records=[self._history_records],
+            )
+            if current_image is None:
+                query_tokens = torch.zeros((1, 1, self.memory_hidden_size), dtype=torch.float32)
+                query_mask = torch.zeros((1, 1), dtype=torch.long)
+            else:
+                query_tokens, query_mask = self.memory_builder.build_current_query_inputs(
+                    images=[current_image],
+                )
+            return {
+                "history_memory_tokens": history_tokens,
+                "history_memory_attention_mask": history_mask,
+                "current_memory_query_tokens": query_tokens,
+                "current_memory_query_attention_mask": query_mask,
+            }
         memory_tokens, memory_mask = self.memory_builder.build_memory_inputs(
             batch_size=1,
             history_records=[self._history_records],
         )
-        return memory_tokens[0], memory_mask[0]
+        return {
+            "memory_tokens": memory_tokens,
+            "memory_attention_mask": memory_mask,
+        }
 
     def _build_prompt(self, obs_dict: dict, target_url: str, start_url: str, max_steps: int) -> str:
         from jamel.train.memory.web_prompt import (
@@ -329,7 +355,8 @@ class MemoryAugAgent:
         screenshot_arr = obs_dict.get("screenshot")
         if screenshot_arr is None:
             raise RuntimeError("Web prompt requires a screenshot in obs_dict; got None.")
-        image = Image.fromarray(screenshot_arr.astype(np.uint8))
+        query_image = Image.fromarray(screenshot_arr.astype(np.uint8))
+        image = query_image
         if self.model_image_size is not None and image.size != self.model_image_size:
             image = image.resize(self.model_image_size, Image.BILINEAR)
         # Split prompt on the single <image> tag to interleave text/image content.
@@ -356,9 +383,13 @@ class MemoryAugAgent:
                 if hasattr(inputs[_k], "shape") and inputs[_k].shape[-1] == _orig_len:
                     inputs[_k] = inputs[_k][..., -self.max_input_tokens:]
 
-        memory_tokens, memory_mask = self._build_memory_inputs()
-        memory_tokens = memory_tokens.unsqueeze(0).to(self.device, dtype=torch.bfloat16)
-        memory_mask = memory_mask.unsqueeze(0).to(self.device, dtype=torch.long)
+        memory_kwargs = {
+            key: value.to(
+                self.device,
+                dtype=torch.bfloat16 if value.dtype.is_floating_point else torch.long,
+            )
+            for key, value in self._build_memory_inputs(current_image=query_image).items()
+        }
 
         input_len = inputs["input_ids"].shape[1]
 
@@ -369,8 +400,7 @@ class MemoryAugAgent:
         try:
             generated = self.model.generate(
                 **inputs,
-                memory_tokens=memory_tokens,
-                memory_attention_mask=memory_mask,
+                **memory_kwargs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=self.temperature > 0,
                 temperature=self.temperature if self.temperature > 0 else None,
@@ -964,9 +994,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory-max-items", type=int, default=512)
     p.add_argument(
         "--memory-builder",
-        choices=["online_tokens", "delta_state", "hybrid"],
+        choices=["online_tokens", "delta_state", "online_delta_state", "hybrid"],
         default=os.environ.get("MEMORY_BUILDER", "online_tokens"),
-        help="History compressor for memory tokens. delta_state selects JAMEL-DeltaState.",
+        help="History compressor for memory tokens. online_delta_state enables q_current reads for saved online checkpoints.",
     )
     p.add_argument("--delta-rank", type=int, default=int(os.environ.get("DELTA_RANK", "8")))
     p.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))

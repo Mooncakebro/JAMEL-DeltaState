@@ -2051,8 +2051,12 @@ class JAMELMemoryAugAdapter:
             self.memory_hidden_size = int(mem_cfg.get("memory_hidden_size", 2048))
         else:
             self.memory_hidden_size = 2048
+        self.use_online_delta_state = getattr(self.model, "delta_state_memory", None) is not None
+        builder_type = self.memory_builder_type
+        if self.use_online_delta_state and builder_type not in {"delta_state", "online_delta_state"}:
+            builder_type = "online_delta_state"
         self.memory_builder = make_history_memory_builder(
-            memory_builder=self.memory_builder_type,
+            memory_builder=builder_type,
             compressor_model_name=self.compressor_model,
             memory_hidden_size=self.memory_hidden_size,
             history_window=self.memory_max_items,
@@ -2065,6 +2069,7 @@ class JAMELMemoryAugAdapter:
             delta_seed=self.delta_seed,
             hybrid_recent_items=self.hybrid_recent_items,
         )
+        self.memory_builder_type = builder_type
         compressor = self.memory_builder.compressor
         tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
         if tokenizer is not None:
@@ -2083,18 +2088,40 @@ class JAMELMemoryAugAdapter:
         inputs = self.processor(text=[prompt_text], return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         inputs.pop("second_per_grid_ts", None)
-        memory_tokens, memory_mask = self.memory_builder.build_memory_inputs(
-            batch_size=1,
-            history_records=[self._history_records],
-        )
-        memory_tokens = memory_tokens[0].unsqueeze(0).to(self.device, dtype=self.torch.bfloat16)
-        memory_mask = memory_mask[0].unsqueeze(0).to(self.device, dtype=self.torch.long)
+        if self.use_online_delta_state:
+            history_tokens, history_mask = self.memory_builder.build_step_token_inputs(
+                batch_size=1,
+                history_records=[self._history_records],
+            )
+            screenshot = obs.get("screenshot") if isinstance(obs, dict) else None
+            if screenshot is None:
+                query_tokens = self.torch.zeros((1, 1, self.memory_hidden_size), dtype=self.torch.float32)
+                query_mask = self.torch.zeros((1, 1), dtype=self.torch.long)
+            else:
+                query_image = Image.fromarray(screenshot.astype("uint8"))
+                query_tokens, query_mask = self.memory_builder.build_current_query_inputs(
+                    images=[query_image],
+                )
+            memory_kwargs = {
+                "history_memory_tokens": history_tokens.to(self.device, dtype=self.torch.bfloat16),
+                "history_memory_attention_mask": history_mask.to(self.device, dtype=self.torch.long),
+                "current_memory_query_tokens": query_tokens.to(self.device, dtype=self.torch.bfloat16),
+                "current_memory_query_attention_mask": query_mask.to(self.device, dtype=self.torch.long),
+            }
+        else:
+            memory_tokens, memory_mask = self.memory_builder.build_memory_inputs(
+                batch_size=1,
+                history_records=[self._history_records],
+            )
+            memory_kwargs = {
+                "memory_tokens": memory_tokens.to(self.device, dtype=self.torch.bfloat16),
+                "memory_attention_mask": memory_mask.to(self.device, dtype=self.torch.long),
+            }
         input_len = inputs["input_ids"].shape[1]
         with self.torch.inference_mode():
             generated = self.model.generate(
                 **inputs,
-                memory_tokens=memory_tokens,
-                memory_attention_mask=memory_mask,
+                **memory_kwargs,
                 max_new_tokens=256,
                 do_sample=False,
             )
@@ -3112,7 +3139,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     parser.add_argument("--memory-max-items", type=int, default=512)
     parser.add_argument(
         "--memory-builder",
-        choices=["online_tokens", "delta_state", "hybrid"],
+        choices=["online_tokens", "delta_state", "online_delta_state", "hybrid"],
         default=os.environ.get("MEMORY_BUILDER", "online_tokens"),
     )
     parser.add_argument("--delta-rank", type=int, default=int(os.environ.get("DELTA_RANK", "8")))

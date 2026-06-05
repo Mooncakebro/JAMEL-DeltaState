@@ -44,6 +44,7 @@ from typing import Any
 
 import pandas as pd
 from PIL import Image
+import torch
 
 
 def _decode_png(image_bytes: bytes | None) -> Image.Image | None:
@@ -65,7 +66,11 @@ def _get_screenshot(row) -> bytes | None:
 
 def build_dataset(args: argparse.Namespace) -> None:
     from jamel.core.env.web.axtree_utils import prune_axtree
-    from jamel.train.memory.delta_state_encoder import MODEL_NAME, make_history_memory_builder
+    from jamel.train.memory.delta_state_encoder import (
+        CURRENT_MEMORY_QUERY_TEXT,
+        MODEL_NAME,
+        make_history_memory_builder,
+    )
     from jamel.train.memory.web_prompt import (
         build_web_prompt,
         extract_axtree_from_observation_str,
@@ -172,9 +177,12 @@ def build_dataset(args: argparse.Namespace) -> None:
     if not all_specs:
         raise RuntimeError("No valid specs found.")
 
-    # ── Compress memory tokens (in session order → max cache reuse) ──────────
+    # ── Compress memory inputs (in session order → max cache reuse) ──────────
+    memory_builder_name = str(args.memory_builder).strip().lower().replace("-", "_")
+    online_delta_state = memory_builder_name == "online_delta_state" or bool(args.online_delta_state)
+    builder_memory_name = "delta_state" if online_delta_state else memory_builder_name
     builder = make_history_memory_builder(
-        memory_builder=args.memory_builder,
+        memory_builder=builder_memory_name,
         compressor_model_name=args.compressor_model,
         memory_hidden_size=args.memory_hidden_size,
         # history_window: upper bound on records passed; use max_memory_items
@@ -195,24 +203,49 @@ def build_dataset(args: argparse.Namespace) -> None:
     if tokenizer is not None:
         tokenizer.add_eos_token = True
     print(
-        f"Memory builder: {args.memory_builder} ({MODEL_NAME if args.memory_builder == 'delta_state' else 'JAMEL'})  "
+        f"Memory builder: {args.memory_builder} ({MODEL_NAME if builder_memory_name == 'delta_state' else 'JAMEL'})  "
         f"hidden_size: {builder.memory_hidden_size}  max_memory_items: {args.max_memory_items}  "
-        f"delta_rank: {args.delta_rank}  delta_slots: {args.delta_memory_slots}"
+        f"delta_rank: {args.delta_rank}  delta_slots: {args.delta_memory_slots}  "
+        f"online_delta_state: {online_delta_state}"
     )
 
     finalized_rows: list[dict[str, Any]] = []
     batch_size = args.compression_batch_size
     for start in range(0, len(all_specs), batch_size):
         batch = all_specs[start: start + batch_size]
-        memory_tokens, memory_mask = builder.build_memory_inputs(
-            batch_size=len(batch),
-            history_records=[s["history_records"] for s in batch],
-        )
-        for i, spec in enumerate(batch):
-            row = {k: v for k, v in spec.items() if k != "history_records"}
-            row["memory_tokens"] = memory_tokens[i].tolist()
-            row["memory_attention_mask"] = memory_mask[i].tolist()
-            finalized_rows.append(row)
+        if online_delta_state:
+            history_rows = builder.build_step_token_rows(
+                batch_size=len(batch),
+                history_records=[s["history_records"] for s in batch],
+            )
+            current_images = [_decode_png(s["current_image_png_bytes"]) for s in batch]
+            if any(image is None for image in current_images):
+                raise RuntimeError("online_delta_state requires every sample to have a current screenshot.")
+            current_query_tokens, current_query_mask = builder.build_current_query_inputs(
+                images=current_images,
+                texts=[args.current_query_text] * len(batch),
+            )
+            for i, spec in enumerate(batch):
+                row = {k: v for k, v in spec.items() if k != "history_records"}
+                if history_rows[i]:
+                    history_tokens = torch.cat(history_rows[i], dim=0)
+                else:
+                    history_tokens = torch.zeros((0, builder.memory_hidden_size), dtype=torch.float32)
+                row["history_memory_tokens"] = history_tokens.tolist()
+                row["history_memory_attention_mask"] = [1] * int(history_tokens.shape[0])
+                row["current_memory_query_tokens"] = current_query_tokens[i].tolist()
+                row["current_memory_query_attention_mask"] = current_query_mask[i].tolist()
+                finalized_rows.append(row)
+        else:
+            memory_tokens, memory_mask = builder.build_memory_inputs(
+                batch_size=len(batch),
+                history_records=[s["history_records"] for s in batch],
+            )
+            for i, spec in enumerate(batch):
+                row = {k: v for k, v in spec.items() if k != "history_records"}
+                row["memory_tokens"] = memory_tokens[i].tolist()
+                row["memory_attention_mask"] = memory_mask[i].tolist()
+                finalized_rows.append(row)
 
         if (start // batch_size + 1) % 10 == 0:
             print(f"  Compressed {start + len(batch)}/{len(all_specs)} samples")
@@ -261,9 +294,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory-hidden-size", default="auto")
     p.add_argument(
         "--memory-builder",
-        choices=["online_tokens", "delta_state", "hybrid"],
+        choices=["online_tokens", "delta_state", "hybrid", "online_delta_state"],
         default="online_tokens",
-        help="History compressor used to produce memory_tokens. delta_state is JAMEL-DeltaState.",
+        help=(
+            "History compressor used to produce memory inputs. "
+            "online_delta_state stores raw history/query embeddings so DeltaState trains inside the actor."
+        ),
+    )
+    p.add_argument(
+        "--online-delta-state",
+        action="store_true",
+        help="Alias for --memory-builder online_delta_state.",
+    )
+    p.add_argument(
+        "--current-query-text",
+        default=CURRENT_MEMORY_QUERY_TEXT,
+        help="Text paired with the current screenshot when producing q_current's compressor embedding.",
     )
     p.add_argument("--delta-rank", type=int, default=8, help="JAMEL-DeltaState associative rank.")
     p.add_argument("--delta-memory-slots", type=int, default=8, help="Number of state-derived memory tokens.")

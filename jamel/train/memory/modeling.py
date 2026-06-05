@@ -19,6 +19,10 @@ from jamel.arch.qwen3vl_compressor.memory_injector import (
     MemoryInjector,
 )
 from jamel.arch.qwen3vl_compressor.config import resolve_torch_dtype
+from jamel.train.memory.delta_state_encoder import (
+    DeltaStateMemoryConfig,
+    DeltaStateMemoryModule,
+)
 
 
 _MEMORY_CONFIG_NAME = "memory_augment_config.json"
@@ -172,6 +176,23 @@ def _profile_log(event: str, *, start_time: float | None = None, **kwargs: Any) 
     print(f"[PROFILE {timestamp}] {event} {extra}".rstrip(), flush=True)
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _online_delta_state_enabled(memory_augment_config: dict[str, Any]) -> bool:
+    builder = str(memory_augment_config.get("memory_builder", "")).strip().lower().replace("-", "_")
+    return bool(
+        _as_bool(memory_augment_config.get("enable_online_delta_state", False))
+        or _as_bool(memory_augment_config.get("online_delta_state", False))
+        or builder == "online_delta_state"
+    )
+
+
 def _normalize_multimodal_position_ids(
     position_ids: torch.Tensor | None,
     *,
@@ -207,8 +228,10 @@ class _MemoryAugmentedBase(nn.Module):
         torch_dtype: str | torch.dtype | None = None,
         trust_remote_code: bool = True,
         llm: Optional[nn.Module] = None,
+        memory_augment_config: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__()
+        self.memory_augment_config = dict(memory_augment_config or {})
         self.base_model_name_or_path = base_model_name_or_path
         self.llm = llm or self._load_backbone(
             base_model_name_or_path=base_model_name_or_path,
@@ -223,11 +246,31 @@ class _MemoryAugmentedBase(nn.Module):
             self.memory_hidden_size = self.llm_hidden_size
         else:
             self.memory_hidden_size = int(memory_hidden_size)
+        self.memory_augment_config.setdefault("memory_hidden_size", self.memory_hidden_size)
         self.aligner = DimensionAligner(
             src_dim=self.memory_hidden_size,
             tgt_dim=self.llm_hidden_size,
         )
         self.injector = MemoryInjector()
+        self.delta_state_memory: DeltaStateMemoryModule | None = None
+        if _online_delta_state_enabled(self.memory_augment_config):
+            self.delta_state_memory = DeltaStateMemoryModule(
+                memory_hidden_size=self.memory_hidden_size,
+                delta_config=DeltaStateMemoryConfig(
+                    rank=int(self.memory_augment_config.get("delta_rank", 8)),
+                    memory_slots=int(self.memory_augment_config.get("delta_memory_slots", 8)),
+                    seed=int(self.memory_augment_config.get("delta_seed", 13)),
+                    beta_bias=float(self.memory_augment_config.get("delta_beta_bias", -1.5)),
+                    value_layer_norm=_as_bool(
+                        self.memory_augment_config.get("delta_value_layer_norm", True),
+                        default=True,
+                    ),
+                ),
+                read_with_current_query=_as_bool(
+                    self.memory_augment_config.get("read_with_current_query", True),
+                    default=True,
+                ),
+            )
 
     @staticmethod
     def _load_backbone(
@@ -269,6 +312,12 @@ class _MemoryAugmentedBase(nn.Module):
         metadata: dict[str, Any] = {}
         if _is_memory_augmented_checkpoint(checkpoint_path):
             metadata = _load_memory_metadata(checkpoint_path)
+        metadata_memory_config = metadata.get("memory_augment_config") or {}
+        if metadata_memory_config:
+            memory_augment_config = {
+                **metadata_memory_config,
+                **memory_augment_config,
+            }
 
         resolved_hidden_size = (
             memory_hidden_size
@@ -290,6 +339,7 @@ class _MemoryAugmentedBase(nn.Module):
             memory_hidden_size=resolved_hidden_size,
             torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
+            memory_augment_config=memory_augment_config,
         )
 
         if metadata:
@@ -444,6 +494,30 @@ class _MemoryAugmentedBase(nn.Module):
             "prefix_length": injected_inputs.prefix_length,
         }
 
+    def _resolve_memory_inputs(
+        self,
+        *,
+        memory_tokens: Optional[torch.Tensor] = None,
+        memory_attention_mask: Optional[torch.Tensor] = None,
+        history_memory_tokens: Optional[torch.Tensor] = None,
+        history_memory_attention_mask: Optional[torch.Tensor] = None,
+        current_memory_query_tokens: Optional[torch.Tensor] = None,
+        current_memory_query_attention_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if history_memory_tokens is None:
+            return memory_tokens, memory_attention_mask
+        if self.delta_state_memory is None:
+            raise ValueError(
+                "history_memory_tokens were provided, but online DeltaState memory is not enabled. "
+                "Set model.memory_augment.enable_online_delta_state=True."
+            )
+        return self.delta_state_memory.tokens_to_state_memory_batch(
+            history_tokens=history_memory_tokens,
+            history_attention_mask=history_memory_attention_mask,
+            current_query_tokens=current_memory_query_tokens,
+            current_query_attention_mask=current_memory_query_attention_mask,
+        )
+
     @staticmethod
     def _prefix_labels(
         labels: torch.Tensor,
@@ -469,6 +543,7 @@ class _MemoryAugmentedBase(nn.Module):
             "base_model_name_or_path": self.base_model_name_or_path,
             "memory_hidden_size": self.memory_hidden_size,
             "class_name": self.__class__.__name__,
+            "memory_augment_config": self.memory_augment_config,
         }
         (save_path / _MEMORY_CONFIG_NAME).write_text(
             json.dumps(metadata, indent=2),
@@ -527,9 +602,21 @@ class MemoryAugmentedCausalLM(_MemoryAugmentedBase):
         position_ids: Optional[torch.Tensor] = None,
         memory_tokens: Optional[torch.Tensor] = None,
         memory_attention_mask: Optional[torch.Tensor] = None,
+        history_memory_tokens: Optional[torch.Tensor] = None,
+        history_memory_attention_mask: Optional[torch.Tensor] = None,
+        current_memory_query_tokens: Optional[torch.Tensor] = None,
+        current_memory_query_attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ):
+        memory_tokens, memory_attention_mask = self._resolve_memory_inputs(
+            memory_tokens=memory_tokens,
+            memory_attention_mask=memory_attention_mask,
+            history_memory_tokens=history_memory_tokens,
+            history_memory_attention_mask=history_memory_attention_mask,
+            current_memory_query_tokens=current_memory_query_tokens,
+            current_memory_query_attention_mask=current_memory_query_attention_mask,
+        )
         model_inputs = self._prepare_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -546,7 +633,12 @@ class MemoryAugmentedCausalLM(_MemoryAugmentedBase):
             )
         if labels is not None:
             model_inputs["labels"] = labels
-        return self.llm(**model_inputs, **kwargs)
+        output = self.llm(**model_inputs, **kwargs)
+        try:
+            output.memory_prefix_length = prefix_length
+        except Exception:
+            pass
+        return output
 
     def generate(
         self,
@@ -555,8 +647,20 @@ class MemoryAugmentedCausalLM(_MemoryAugmentedBase):
         position_ids: Optional[torch.Tensor] = None,
         memory_tokens: Optional[torch.Tensor] = None,
         memory_attention_mask: Optional[torch.Tensor] = None,
+        history_memory_tokens: Optional[torch.Tensor] = None,
+        history_memory_attention_mask: Optional[torch.Tensor] = None,
+        current_memory_query_tokens: Optional[torch.Tensor] = None,
+        current_memory_query_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ):
+        memory_tokens, memory_attention_mask = self._resolve_memory_inputs(
+            memory_tokens=memory_tokens,
+            memory_attention_mask=memory_attention_mask,
+            history_memory_tokens=history_memory_tokens,
+            history_memory_attention_mask=history_memory_attention_mask,
+            current_memory_query_tokens=current_memory_query_tokens,
+            current_memory_query_attention_mask=current_memory_query_attention_mask,
+        )
         model_inputs = self._prepare_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -598,8 +702,20 @@ class MemoryAugmentedValueModel(_MemoryAugmentedBase):
         position_ids: Optional[torch.Tensor] = None,
         memory_tokens: Optional[torch.Tensor] = None,
         memory_attention_mask: Optional[torch.Tensor] = None,
+        history_memory_tokens: Optional[torch.Tensor] = None,
+        history_memory_attention_mask: Optional[torch.Tensor] = None,
+        current_memory_query_tokens: Optional[torch.Tensor] = None,
+        current_memory_query_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> TokenClassifierOutput:
+        memory_tokens, memory_attention_mask = self._resolve_memory_inputs(
+            memory_tokens=memory_tokens,
+            memory_attention_mask=memory_attention_mask,
+            history_memory_tokens=history_memory_tokens,
+            history_memory_attention_mask=history_memory_attention_mask,
+            current_memory_query_tokens=current_memory_query_tokens,
+            current_memory_query_attention_mask=current_memory_query_attention_mask,
+        )
         model_inputs = self._prepare_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,

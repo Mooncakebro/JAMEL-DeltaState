@@ -48,6 +48,19 @@ export PYTHONPATH="$JAMEL_ROOT:$VERL_AGENT_ROOT:${PYTHONPATH}"
 BASE_MODEL_PATH=${BASE_MODEL_PATH:-${MODEL_PATH:-Qwen/Qwen2.5-VL-7B-Instruct}}
 MEMORY_HIDDEN_SIZE=${MEMORY_HIDDEN_SIZE:-2048}
 MEMORY_MAX_ITEMS=${MEMORY_MAX_ITEMS:-512}
+MEMORY_BUILDER=${MEMORY_BUILDER:-online_tokens}
+DELTA_RANK=${DELTA_RANK:-8}
+DELTA_MEMORY_SLOTS=${DELTA_MEMORY_SLOTS:-8}
+DELTA_SEED=${DELTA_SEED:-13}
+READ_WITH_CURRENT_QUERY=${READ_WITH_CURRENT_QUERY:-1}
+MEMORY_BUILDER_NORMALIZED=${MEMORY_BUILDER//-/_}
+if [[ -z "${ONLINE_DELTA_STATE:-}" ]]; then
+    if [[ "$MEMORY_BUILDER_NORMALIZED" == "online_delta_state" ]]; then
+        ONLINE_DELTA_STATE=1
+    else
+        ONLINE_DELTA_STATE=0
+    fi
+fi
 MAX_LENGTH=${MAX_LENGTH:-8192}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-1}
 
@@ -135,10 +148,17 @@ torchrun \
     data.custom_cls.name=JAMELMemoryVLTokenSFTDataset \
     "+data.memory_max_items=$MEMORY_MAX_ITEMS" \
     "+data.memory_hidden_size=$MEMORY_HIDDEN_SIZE" \
+    "+data.use_online_delta_state=$ONLINE_DELTA_STATE" \
     model.partial_pretrain="$BASE_MODEL_PATH" \
     "model.custom_cls.path=file://$JAMEL_ROOT/jamel/train/memory/modeling.py" \
     model.custom_cls.name=MemoryAugmentedCausalLM \
     model.memory_augment.memory_hidden_size="$MEMORY_HIDDEN_SIZE" \
+    "+model.memory_augment.memory_builder=$MEMORY_BUILDER" \
+    "+model.memory_augment.enable_online_delta_state=$ONLINE_DELTA_STATE" \
+    "+model.memory_augment.delta_rank=$DELTA_RANK" \
+    "+model.memory_augment.delta_memory_slots=$DELTA_MEMORY_SLOTS" \
+    "+model.memory_augment.delta_seed=$DELTA_SEED" \
+    "+model.memory_augment.read_with_current_query=$READ_WITH_CURRENT_QUERY" \
     model.enable_gradient_checkpointing=${GRADIENT_CHECKPOINTING} \
     model.strategy=fsdp2 \
     model.lora_rank=0 \

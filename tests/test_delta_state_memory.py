@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from jamel.train.memory.delta_state_encoder import (
+    DeltaStateMemoryModule,
     DeltaStateHistoryMemoryBuilder,
     make_history_memory_builder,
 )
@@ -94,6 +95,33 @@ def test_delta_state_builder_uses_trainable_memory_projections():
     assert v.shape == (2, 6)
     assert beta.shape == (2, 3)
     assert builder._tokens_to_state_memory(x).shape == (2, 6)
+
+
+def test_delta_state_online_current_query_trains_w_q():
+    module = DeltaStateMemoryModule(
+        memory_hidden_size=6,
+        delta_rank=3,
+        delta_memory_slots=2,
+        delta_seed=7,
+    )
+    history = torch.arange(1, 19, dtype=torch.float32).reshape(1, 3, 6)
+    history_mask = torch.ones((1, 3), dtype=torch.long)
+    current_query = torch.arange(1, 7, dtype=torch.float32).reshape(1, 1, 6)
+    current_query_mask = torch.ones((1, 1), dtype=torch.long)
+
+    tokens, mask = module.tokens_to_state_memory_batch(
+        history_tokens=history,
+        history_attention_mask=history_mask,
+        current_query_tokens=current_query,
+        current_query_attention_mask=current_query_mask,
+    )
+    loss = tokens.pow(2).sum()
+    loss.backward()
+
+    assert tokens.shape == (1, 2, 6)
+    assert mask.shape == (1, 2)
+    assert module.W_q.weight.grad is not None
+    assert module.W_q.weight.grad.abs().sum() > 0
 
 
 def test_factory_accepts_delta_state_name():

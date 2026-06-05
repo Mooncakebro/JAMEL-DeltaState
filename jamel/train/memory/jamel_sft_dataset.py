@@ -32,6 +32,14 @@ def _to_numeric_array(value, *, dtype):
     return np.asarray(value, dtype=dtype)
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _build_user_message(prompt: str) -> list[dict]:
     segments = prompt.split("<image>")
     content: list[dict] = []
@@ -149,8 +157,22 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         self.image_key = config.get("image_key", "current_image_png_bytes")
         self.memory_tokens_key = config.get("memory_tokens_key", "memory_tokens")
         self.memory_attention_mask_key = config.get("memory_attention_mask_key", "memory_attention_mask")
+        self.history_memory_tokens_key = config.get("history_memory_tokens_key", "history_memory_tokens")
+        self.history_memory_attention_mask_key = config.get(
+            "history_memory_attention_mask_key",
+            "history_memory_attention_mask",
+        )
+        self.current_memory_query_tokens_key = config.get(
+            "current_memory_query_tokens_key",
+            "current_memory_query_tokens",
+        )
+        self.current_memory_query_attention_mask_key = config.get(
+            "current_memory_query_attention_mask_key",
+            "current_memory_query_attention_mask",
+        )
         self.memory_max_items = config.get("memory_max_items", None)
         self.memory_hidden_size = config.get("memory_hidden_size", None)
+        self.use_online_delta_state = _as_bool(config.get("use_online_delta_state", False))
         self.use_shm = config.get("use_shm", False)
 
         self._download()
@@ -348,8 +370,14 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         if image is not None:
             image.save(os.path.join(sample_dir, "screenshot.png"))
 
-        mt = _to_numeric_array(row[self.memory_tokens_key], dtype=np.float32)
-        np.save(os.path.join(sample_dir, "memory_tokens.npy"), mt)
+        if self.history_memory_tokens_key in row and row.get(self.history_memory_tokens_key) is not None:
+            mt = _to_numeric_array(row[self.history_memory_tokens_key], dtype=np.float32)
+            np.save(os.path.join(sample_dir, "history_memory_tokens.npy"), mt)
+            memory_shape = list(mt.shape) if hasattr(mt, "shape") else None
+        else:
+            mt = _to_numeric_array(row[self.memory_tokens_key], dtype=np.float32)
+            np.save(os.path.join(sample_dir, "memory_tokens.npy"), mt)
+            memory_shape = list(mt.shape) if hasattr(mt, "shape") else None
 
         meta = {
             "session_id": str(row.get("session_id", "")),
@@ -367,7 +395,7 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
             "padding_count": int(input_ids.shape[0] - valid_len),
             "has_image": image is not None,
             "image_size": list(image.size) if image is not None else None,
-            "memory_tokens_shape": list(mt.shape) if hasattr(mt, "shape") else None,
+            "memory_tokens_shape": memory_shape,
         }
         with open(os.path.join(sample_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -401,6 +429,56 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         padded_tokens[:valid_count] = memory_tokens[:valid_count]
         padded_mask[:valid_count] = memory_attention_mask[:valid_count].to(torch.long)
         return padded_tokens, padded_mask
+
+    def _pad_history_memory(self, history_tokens: torch.Tensor, history_attention_mask: torch.Tensor):
+        hidden_size = self.memory_hidden_size or 2048
+        max_items = self.memory_max_items or (
+            int(history_tokens.shape[0]) if history_tokens.ndim >= 2 else 0
+        )
+        max_items = max(1, int(max_items))
+
+        if history_tokens.numel() == 0:
+            return (
+                torch.zeros((max_items, int(hidden_size)), dtype=torch.float32),
+                torch.zeros((max_items,), dtype=torch.long),
+            )
+        if history_tokens.ndim == 1:
+            history_tokens = history_tokens.unsqueeze(0)
+        if history_attention_mask.ndim == 0:
+            history_attention_mask = history_attention_mask.unsqueeze(0)
+        hidden_size = history_tokens.shape[-1]
+        padded_tokens = torch.zeros((max_items, hidden_size), dtype=history_tokens.dtype)
+        padded_mask = torch.zeros((max_items,), dtype=torch.long)
+        valid_count = min(max_items, history_tokens.shape[0])
+        padded_tokens[:valid_count] = history_tokens[-valid_count:]
+        padded_mask[:valid_count] = history_attention_mask[-valid_count:].to(torch.long)
+        return padded_tokens, padded_mask
+
+    def _pad_current_query_memory(
+        self,
+        query_tokens: torch.Tensor,
+        query_attention_mask: torch.Tensor,
+    ):
+        hidden_size = self.memory_hidden_size or 2048
+        if query_tokens.numel() == 0:
+            return (
+                torch.zeros((1, int(hidden_size)), dtype=torch.float32),
+                torch.zeros((1,), dtype=torch.long),
+            )
+        if query_tokens.ndim == 1:
+            query_tokens = query_tokens.unsqueeze(0)
+        if query_attention_mask.ndim == 0:
+            query_attention_mask = query_attention_mask.unsqueeze(0)
+        return query_tokens.to(torch.float32), query_attention_mask.to(torch.long)
+
+    def _has_online_delta_state(self, row) -> bool:
+        return (
+            self.use_online_delta_state
+            or (
+                self.history_memory_tokens_key in row
+                and self.current_memory_query_tokens_key in row
+            )
+        )
 
     def _build_model_inputs(
         self, prompt: str, response: str, image: Image.Image | None
@@ -576,24 +654,81 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
             except Exception:
                 logger.warning("JAMEL SFT: failed to save training sample.", exc_info=True)
 
-        memory_tokens = torch.tensor(
-            _to_numeric_array(row[self.memory_tokens_key], dtype=np.float32), dtype=torch.float32,
-        )
-        if self.memory_attention_mask_key in row and row[self.memory_attention_mask_key] is not None:
-            memory_attention_mask = torch.tensor(
-                _to_numeric_array(row[self.memory_attention_mask_key], dtype=np.int64),
-                dtype=torch.long,
+        if self._has_online_delta_state(row):
+            history_memory_tokens = torch.tensor(
+                _to_numeric_array(row[self.history_memory_tokens_key], dtype=np.float32),
+                dtype=torch.float32,
             )
+            if (
+                self.history_memory_attention_mask_key in row
+                and row[self.history_memory_attention_mask_key] is not None
+            ):
+                history_memory_attention_mask = torch.tensor(
+                    _to_numeric_array(row[self.history_memory_attention_mask_key], dtype=np.int64),
+                    dtype=torch.long,
+                )
+            else:
+                history_memory_attention_mask = torch.ones(
+                    history_memory_tokens.shape[0],
+                    dtype=torch.long,
+                )
+            history_memory_tokens, history_memory_attention_mask = self._pad_history_memory(
+                history_memory_tokens,
+                history_memory_attention_mask,
+            )
+
+            current_memory_query_tokens = torch.tensor(
+                _to_numeric_array(row[self.current_memory_query_tokens_key], dtype=np.float32),
+                dtype=torch.float32,
+            )
+            if (
+                self.current_memory_query_attention_mask_key in row
+                and row[self.current_memory_query_attention_mask_key] is not None
+            ):
+                current_memory_query_attention_mask = torch.tensor(
+                    _to_numeric_array(row[self.current_memory_query_attention_mask_key], dtype=np.int64),
+                    dtype=torch.long,
+                )
+            else:
+                current_memory_query_attention_mask = torch.ones(
+                    current_memory_query_tokens.shape[0],
+                    dtype=torch.long,
+                )
+            current_memory_query_tokens, current_memory_query_attention_mask = (
+                self._pad_current_query_memory(
+                    current_memory_query_tokens,
+                    current_memory_query_attention_mask,
+                )
+            )
+
+            memory_payload = {
+                "history_memory_tokens": history_memory_tokens,
+                "history_memory_attention_mask": history_memory_attention_mask,
+                "current_memory_query_tokens": current_memory_query_tokens,
+                "current_memory_query_attention_mask": current_memory_query_attention_mask,
+            }
         else:
-            memory_attention_mask = torch.ones(memory_tokens.shape[0], dtype=torch.long)
-        memory_tokens, memory_attention_mask = self._pad_memory(memory_tokens, memory_attention_mask)
+            memory_tokens = torch.tensor(
+                _to_numeric_array(row[self.memory_tokens_key], dtype=np.float32), dtype=torch.float32,
+            )
+            if self.memory_attention_mask_key in row and row[self.memory_attention_mask_key] is not None:
+                memory_attention_mask = torch.tensor(
+                    _to_numeric_array(row[self.memory_attention_mask_key], dtype=np.int64),
+                    dtype=torch.long,
+                )
+            else:
+                memory_attention_mask = torch.ones(memory_tokens.shape[0], dtype=torch.long)
+            memory_tokens, memory_attention_mask = self._pad_memory(memory_tokens, memory_attention_mask)
+            memory_payload = {
+                "memory_tokens": memory_tokens,
+                "memory_attention_mask": memory_attention_mask,
+            }
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "loss_mask": loss_mask,
-            "memory_tokens": memory_tokens,
-            "memory_attention_mask": memory_attention_mask,
             "multi_modal_inputs": multi_modal_inputs,
+            **memory_payload,
         }
