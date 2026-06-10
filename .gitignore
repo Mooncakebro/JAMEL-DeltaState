@@ -43,3 +43,4 @@ FIX_GUIDE.md
 /dataset
 /data/ExplorerSFT-ReAct_Dataset
 /LLMs
+/.vscode

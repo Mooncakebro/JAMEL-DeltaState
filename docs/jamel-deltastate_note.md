@@ -1,3 +1,32 @@
+# Trouble-shooting when setting up the environment
+1. after:
+```bash
+uv pip install -r third_party/verl-agent/requirements.txt
+```
+get:
+```bash
+...
+ModuleNotFoundError: No module named 'torch'<br/><br/>hint: This error likely indicates that `flash-attn@2.8.3` depends on `torch`, but doesn't declare it as a build dependency. If `flash-attn` is a first-party package, consider adding `torch` to its `build-system.requires`. Otherwise, either add it to your `pyproject.toml` under:<br/><br/>[tool.uv.extra-build-dependencies]<br/>flash-attn = ["torch"]<br/><br/>or `uv pip install torch` into the environment and re-run with `--no-build-isolation`.
+```
+do:
+```bash
+uv pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+
+uv pip install ninja packaging setuptools wheel
+
+mkdir -p ./tmp
+export TMPDIR=./tmp
+export TEMP=./tmp
+export TMP=./tmp
+export MAX_JOBS=4
+uv pip install --no-build-isolation -r third_party/verl-agent/requirements.txt
+
+
+```
+
+
+
+
 # Prepare Data for JAMEL-DeltaState
 python jamel/train/memory/prepare_sft_dataset.py \
   --input data/ExplorerSFT-ReAct/data/react-text/*/trajectory.parquet \
