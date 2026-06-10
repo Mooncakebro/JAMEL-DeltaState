@@ -46,6 +46,10 @@ import pandas as pd
 from PIL import Image
 import torch
 
+from jamel.train.memory.delta_state_encoder import (
+    CURRENT_MEMORY_QUERY_TEXT,
+)
+
 
 def _decode_png(image_bytes: bytes | None) -> Image.Image | None:
     if image_bytes is None:
