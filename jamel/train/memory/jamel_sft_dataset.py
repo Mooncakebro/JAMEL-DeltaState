@@ -706,6 +706,10 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
                 "history_memory_attention_mask": history_memory_attention_mask,
                 "current_memory_query_tokens": current_memory_query_tokens,
                 "current_memory_query_attention_mask": current_memory_query_attention_mask,
+                # verl trainer expects these keys to exist; in online_delta_state
+                # mode they are None because the model computes memory_tokens online.
+                "memory_tokens": None,
+                "memory_attention_mask": None,
             }
         else:
             memory_tokens = torch.tensor(
