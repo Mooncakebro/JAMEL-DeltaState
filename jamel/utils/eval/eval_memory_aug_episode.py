@@ -261,7 +261,7 @@ class MemoryAugAgent:
             self.memory_hidden_size = 2048
         self.use_online_delta_state = getattr(self.model, "delta_state_memory", None) is not None
         builder_type = self.memory_builder_type
-        if self.use_online_delta_state and builder_type not in {"delta_state", "online_delta_state"}:
+        if self.use_online_delta_state and builder_type not in {"online_delta_state", "hybrid"}:
             builder_type = "online_delta_state"
         print(
             f"[model] memory_hidden_size={self.memory_hidden_size}, memory_max_items={memory_max_items}, "
@@ -284,7 +284,7 @@ class MemoryAugAgent:
             hybrid_recent_items=self.hybrid_recent_items,
         )
         self.memory_builder_type = builder_type
-        if self.memory_builder_type in {"delta_state", "online_delta_state"}:
+        if self.memory_builder_type in {"online_delta_state", "hybrid"}:
             print(f"[model] using {MODEL_NAME}")
         compressor = self.memory_builder.compressor
         tokenizer = getattr(getattr(compressor, "processor", None), "tokenizer", None)
@@ -304,6 +304,13 @@ class MemoryAugAgent:
                 batch_size=1,
                 history_records=[self._history_records],
             )
+            recent_tokens = None
+            recent_mask = None
+            if self.memory_builder_type == "hybrid":
+                recent_tokens, recent_mask = self.memory_builder.build_recent_memory_inputs(
+                    batch_size=1,
+                    history_records=[self._history_records],
+                )
             if current_image is None:
                 query_tokens = torch.zeros((1, 1, self.memory_hidden_size), dtype=torch.float32)
                 query_mask = torch.zeros((1, 1), dtype=torch.long)
@@ -311,12 +318,16 @@ class MemoryAugAgent:
                 query_tokens, query_mask = self.memory_builder.build_current_query_inputs(
                     images=[current_image],
                 )
-            return {
+            payload = {
                 "history_memory_tokens": history_tokens,
                 "history_memory_attention_mask": history_mask,
                 "current_memory_query_tokens": query_tokens,
                 "current_memory_query_attention_mask": query_mask,
             }
+            if recent_tokens is not None and recent_mask is not None:
+                payload["memory_tokens"] = recent_tokens
+                payload["memory_attention_mask"] = recent_mask
+            return payload
         memory_tokens, memory_mask = self.memory_builder.build_memory_inputs(
             batch_size=1,
             history_records=[self._history_records],
@@ -994,9 +1005,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory-max-items", type=int, default=512)
     p.add_argument(
         "--memory-builder",
-        choices=["online_tokens", "delta_state", "online_delta_state", "hybrid"],
+        choices=["online_tokens", "online_delta_state", "hybrid"],
         default=os.environ.get("MEMORY_BUILDER", "online_tokens"),
-        help="History compressor for memory tokens. online_delta_state enables q_current reads for saved online checkpoints.",
+        help="History compressor for memory tokens. online_delta_state and hybrid compute DeltaState inside the actor.",
     )
     p.add_argument("--delta-rank", type=int, default=int(os.environ.get("DELTA_RANK", "8")))
     p.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))

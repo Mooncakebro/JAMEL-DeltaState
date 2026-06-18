@@ -52,10 +52,11 @@ MEMORY_BUILDER=${MEMORY_BUILDER:-online_tokens}
 DELTA_RANK=${DELTA_RANK:-8}
 DELTA_MEMORY_SLOTS=${DELTA_MEMORY_SLOTS:-8}
 DELTA_SEED=${DELTA_SEED:-13}
+HYBRID_RECENT_ITEMS=${HYBRID_RECENT_ITEMS:-32}
 READ_WITH_CURRENT_QUERY=${READ_WITH_CURRENT_QUERY:-1}
 MEMORY_BUILDER_NORMALIZED=${MEMORY_BUILDER//-/_}
 if [[ -z "${ONLINE_DELTA_STATE:-}" ]]; then
-    if [[ "$MEMORY_BUILDER_NORMALIZED" == "online_delta_state" ]]; then
+    if [[ "$MEMORY_BUILDER_NORMALIZED" == "online_delta_state" || "$MEMORY_BUILDER_NORMALIZED" == "hybrid" ]]; then
         ONLINE_DELTA_STATE=1
     else
         ONLINE_DELTA_STATE=0
@@ -149,6 +150,7 @@ torchrun \
     "+data.memory_max_items=$MEMORY_MAX_ITEMS" \
     "+data.memory_hidden_size=$MEMORY_HIDDEN_SIZE" \
     "+data.use_online_delta_state=$ONLINE_DELTA_STATE" \
+    "+data.hybrid_recent_items=$HYBRID_RECENT_ITEMS" \
     model.partial_pretrain="$BASE_MODEL_PATH" \
     "model.custom_cls.path=file://$JAMEL_ROOT/jamel/train/memory/modeling.py" \
     model.custom_cls.name=MemoryAugmentedCausalLM \

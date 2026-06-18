@@ -37,6 +37,43 @@ try:
 UV_HTTP_TIMEOUT=300 uv sync --locked --python 3.10 --extra dev --extra train
 ```
 
+3. Install Node.js and Chinese font
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc
+nvm install 18
+nvm use 18
+node --version    # 应输出 v18.x.x
+npm --version
+
+npm install -g monocart-coverage-reports monocart-locator
+
+pip install fonttools
+
+# verify
+node --version                    # v18+
+npm list -g monocart-coverage-reports 2>/dev/null  # 应该显示版本
+fc-list :lang=zh | head -3         # 中文字体 (非关键)
+
+```
+4. Get:
+```
+BrowserType.launch: ENOENT: no such file or directory, mkdtemp 'tmp/playwright-artifacts-XXXXXXPWMKVE'
+```
+do
+```bash
+mkdir -p tmp
+```
+
+
+# Dataset download  (need data owner's permission)
+```bash
+pip install modelscope -U
+
+modelscope login
+
+modelscope download --dataset BlitherBoom812/ExplorerSFT-ReAct --local_dir ./data/ExplorerSFT-ReAct_Dataset
+```
 
 
 # Prepare Data for JAMEL-DeltaState (need RAM~400G + A800 GPU)
@@ -92,3 +129,66 @@ bash shell/run_qwen25vl_7b_sft.sh \
     model.lora_rank=64 \
     model.lora_alpha=128 \
     "model.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]"
+
+
+# Train (LoRA, on 2 A800)
+TRAIN_FILE=./data/explorer_sft_online_delta_state/jamel_memory_sft_train.parquet \
+VAL_FILE=./data/explorer_sft_online_delta_state/jamel_memory_sft_val.parquet \
+BASE_MODEL_PATH=./LLMs/Qwen2.5-VL-7B-Instruct \
+COMPRESSOR_MODEL=./LLMs/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=./outputs/explorer_delta_sft_ckpt \
+OUTPUT_MODEL_PATH=./outputs/explorer_delta_model \
+MEMORY_BUILDER=online_delta_state \
+ONLINE_DELTA_STATE=1 \
+TOTAL_EPOCHS=2 \
+NPROC_PER_NODE=2 \
+MAX_LENGTH=8192 \
+TRAIN_BATCH_SIZE=8 \
+MICRO_BATCH_SIZE_PER_GPU=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash shell/run_qwen25vl_7b_sft.sh \
+    model.lora_rank=64 \
+    model.lora_alpha=128 \
+    "model.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]"
+
+
+# Merge the base model and LoRA blocks (If use LoRA to PEFT)
+```bash
+# ① 重新合并
+CKPT=$(ls -d ./outputs/explorer_delta_sft_ckpt/global_step_* | sort -t_ -k3 -n | tail -1)
+
+python scripts/merge_lora_checkpoint.py \
+    --checkpoint "$CKPT" \
+    --output "${CKPT}_merged" \
+    --lora-alpha 128 \
+    --lora-rank 64
+
+python -m jamel.train.memory.package_model \
+    --checkpoint "${CKPT}_merged" \
+    --compressor-model ./LLMs/Qwen3-VL-2B-Instruct \
+    --output-model-path ./outputs/explorer_delta_model_merged
+
+```
+
+
+# Eval (on test10)
+MODEL_PATH=./outputs/explorer_delta_model_merged \
+APPS_MODE=test10 \
+MAX_STEPS=50 \
+NUM_SESSIONS=1 \
+NUM_GPUS=2 \
+WORKERS_PER_GPU=1 \
+MEMORY_BUILDER=online_delta_state \
+EVAL_OUTPUT=./outputs/eval_test10 \
+bash shell/run_eval.sh
+
+
+# Eval (on 1 app, e.g. weibo)
+MODEL_PATH=./outputs/explorer_delta_model_merged \
+APPS=weibo \
+NUM_GPUS=1 \
+WORKERS_PER_GPU=1 \
+MAX_STEPS=20 \
+MEMORY_BUILDER=online_delta_state \
+EVAL_OUTPUT=./outputs/eval_weibo \
+bash shell/run_eval.sh

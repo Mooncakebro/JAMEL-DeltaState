@@ -173,6 +173,7 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         self.memory_max_items = config.get("memory_max_items", None)
         self.memory_hidden_size = config.get("memory_hidden_size", None)
         self.use_online_delta_state = _as_bool(config.get("use_online_delta_state", False))
+        self.hybrid_recent_items = config.get("hybrid_recent_items", None)
         self.use_shm = config.get("use_shm", False)
 
         self._download()
@@ -422,6 +423,8 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
             memory_attention_mask = memory_attention_mask.unsqueeze(0)
 
         max_items = self.memory_max_items or memory_tokens.shape[0]
+        if self._has_online_delta_state(row=None) and self.hybrid_recent_items is not None:
+            max_items = self.hybrid_recent_items
         hidden_size = memory_tokens.shape[-1]
         padded_tokens = torch.zeros((max_items, hidden_size), dtype=memory_tokens.dtype)
         padded_mask = torch.zeros((max_items,), dtype=torch.long)
@@ -472,6 +475,8 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         return query_tokens.to(torch.float32), query_attention_mask.to(torch.long)
 
     def _has_online_delta_state(self, row) -> bool:
+        if row is None:
+            return self.use_online_delta_state
         return (
             self.use_online_delta_state
             or (
@@ -701,15 +706,33 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
                 )
             )
 
+            if self.memory_tokens_key in row and row.get(self.memory_tokens_key) is not None:
+                memory_tokens = torch.tensor(
+                    _to_numeric_array(row[self.memory_tokens_key], dtype=np.float32),
+                    dtype=torch.float32,
+                )
+                if self.memory_attention_mask_key in row and row[self.memory_attention_mask_key] is not None:
+                    memory_attention_mask = torch.tensor(
+                        _to_numeric_array(row[self.memory_attention_mask_key], dtype=np.int64),
+                        dtype=torch.long,
+                    )
+                else:
+                    memory_attention_mask = torch.ones(memory_tokens.shape[0], dtype=torch.long)
+                memory_tokens, memory_attention_mask = self._pad_memory(memory_tokens, memory_attention_mask)
+            else:
+                memory_tokens = None
+                memory_attention_mask = None
+
             memory_payload = {
                 "history_memory_tokens": history_memory_tokens,
                 "history_memory_attention_mask": history_memory_attention_mask,
                 "current_memory_query_tokens": current_memory_query_tokens,
                 "current_memory_query_attention_mask": current_memory_query_attention_mask,
-                # verl trainer expects these keys to exist; in online_delta_state
-                # mode they are None because the model computes memory_tokens online.
-                "memory_tokens": None,
-                "memory_attention_mask": None,
+                # Pure online_delta_state has None here. Hybrid keeps recent
+                # original JAMEL tokens here and the actor appends them after
+                # the online DeltaState read.
+                "memory_tokens": memory_tokens,
+                "memory_attention_mask": memory_attention_mask,
             }
         else:
             memory_tokens = torch.tensor(

@@ -14,7 +14,7 @@ else:
 
 
 MODEL_NAME = "JAMEL-DeltaState"
-VALID_MEMORY_BUILDERS = ("online_tokens", "delta_state", "online_delta_state", "hybrid")
+VALID_MEMORY_BUILDERS = ("online_tokens", "online_delta_state", "hybrid")
 CURRENT_MEMORY_QUERY_TEXT = "Current browser state for memory read."
 
 
@@ -497,7 +497,14 @@ class DeltaStateHistoryMemoryBuilder(DeltaStateMemoryModule):
 
 
 class HybridHistoryMemoryBuilder:
-    """Concatenate JAMEL-DeltaState tokens with recent original JAMEL tokens."""
+    """Online DeltaState history plus recent original JAMEL memory tokens.
+
+    Hybrid no longer computes offline DeltaState tokens. It exposes the same
+    online history/query tensors as ``online_delta_state`` and additionally
+    packs the most recent step embeddings as ordinary JAMEL memory tokens.
+    The actor computes the DeltaState read online, then concatenates the recent
+    tokens in ``MemoryAugmentedCausalLM._resolve_memory_inputs``.
+    """
 
     builder_name = "hybrid"
 
@@ -542,23 +549,64 @@ class HybridHistoryMemoryBuilder:
             delta_memory_slots=delta_memory_slots,
             delta_seed=delta_seed,
         )
-        recent_limit = max(1, int(hybrid_recent_items))
-        from jamel.train.memory.encoder import OnlineHistoryMemoryBuilder
-
-        self.online_builder = OnlineHistoryMemoryBuilder(
-            compressor_model_name=compressor_model_name,
-            memory_hidden_size=memory_hidden_size,
-            history_window=recent_limit,
-            max_memory_items=recent_limit,
-            history_action_prefix=history_action_prefix,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            cache_history_memory=cache_history_memory,
-            compressor=shared_compressor,
-        )
         self.compressor = shared_compressor
         self.memory_hidden_size = int(shared_compressor.hidden_size)
-        self.hybrid_recent_items = recent_limit
+        self.hybrid_recent_items = max(1, int(hybrid_recent_items))
+
+    def build_step_token_rows(
+        self,
+        *,
+        batch_size: int,
+        history_records: Sequence[Sequence[dict[str, Any]]] | None,
+    ) -> list[list[torch.Tensor]]:
+        return self.delta_builder.build_step_token_rows(
+            batch_size=batch_size,
+            history_records=history_records,
+        )
+
+    def build_step_token_inputs(
+        self,
+        *,
+        batch_size: int,
+        history_records: Sequence[Sequence[dict[str, Any]]] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.delta_builder.build_step_token_inputs(
+            batch_size=batch_size,
+            history_records=history_records,
+        )
+
+    def build_current_query_inputs(
+        self,
+        *,
+        images: Sequence[Any],
+        texts: Sequence[str] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.delta_builder.build_current_query_inputs(images=images, texts=texts)
+
+    def build_recent_memory_inputs(
+        self,
+        *,
+        batch_size: int,
+        history_records: Sequence[Sequence[dict[str, Any]]] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sample_rows = self.build_step_token_rows(
+            batch_size=batch_size,
+            history_records=history_records,
+        )
+        max_rows = self.hybrid_recent_items
+        tokens = torch.zeros(
+            (batch_size, max_rows, self.memory_hidden_size),
+            dtype=torch.float32,
+        )
+        mask = torch.zeros((batch_size, max_rows), dtype=torch.long)
+        for sample_idx, rows in enumerate(sample_rows):
+            if not rows:
+                continue
+            sample_tokens = torch.cat(rows, dim=0)[-max_rows:]
+            valid_count = min(max_rows, sample_tokens.shape[0])
+            tokens[sample_idx, :valid_count] = sample_tokens[:valid_count]
+            mask[sample_idx, :valid_count] = 1
+        return tokens, mask
 
     def build_memory_inputs(
         self,
@@ -566,19 +614,10 @@ class HybridHistoryMemoryBuilder:
         batch_size: int,
         history_records: Sequence[Sequence[dict[str, Any]]] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        delta_tokens, delta_mask = self.delta_builder.build_memory_inputs(
-            batch_size=batch_size,
-            history_records=history_records,
-        )
-        online_tokens, online_mask = self.online_builder.build_memory_inputs(
-            batch_size=batch_size,
-            history_records=history_records,
-        )
-        if online_tokens.numel() == 0:
-            return delta_tokens, delta_mask
-        return (
-            torch.cat([delta_tokens, online_tokens], dim=1),
-            torch.cat([delta_mask, online_mask], dim=1),
+        raise ValueError(
+            "memory_builder='hybrid' requires online DeltaState. Use "
+            "build_step_token_inputs/build_current_query_inputs plus "
+            "build_recent_memory_inputs, and pass all tensors to the actor."
         )
 
 
@@ -619,7 +658,7 @@ def make_history_memory_builder(
         from jamel.train.memory.encoder import OnlineHistoryMemoryBuilder
 
         return OnlineHistoryMemoryBuilder(**common)
-    if normalized in {"delta_state", "online_delta_state"}:
+    if normalized == "online_delta_state":
         return DeltaStateHistoryMemoryBuilder(
             **common,
             delta_rank=delta_rank,

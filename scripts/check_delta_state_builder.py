@@ -54,7 +54,7 @@ def main() -> None:
     assert not torch.allclose(tokens[0], tokens[1])
 
     builder = make_history_memory_builder(
-        memory_builder="delta-state",
+        memory_builder="online_delta_state",
         compressor_model_name="fake",
         memory_hidden_size=6,
         compressor=FakeCompressor(),

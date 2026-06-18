@@ -189,7 +189,7 @@ def _online_delta_state_enabled(memory_augment_config: dict[str, Any]) -> bool:
     return bool(
         _as_bool(memory_augment_config.get("enable_online_delta_state", False))
         or _as_bool(memory_augment_config.get("online_delta_state", False))
-        or builder == "online_delta_state"
+        or builder in {"online_delta_state", "hybrid"}
     )
 
 
@@ -511,11 +511,34 @@ class _MemoryAugmentedBase(nn.Module):
                 "history_memory_tokens were provided, but online DeltaState memory is not enabled. "
                 "Set model.memory_augment.enable_online_delta_state=True."
             )
-        return self.delta_state_memory.tokens_to_state_memory_batch(
+        delta_tokens, delta_mask = self.delta_state_memory.tokens_to_state_memory_batch(
             history_tokens=history_memory_tokens,
             history_attention_mask=history_memory_attention_mask,
             current_query_tokens=current_memory_query_tokens,
             current_query_attention_mask=current_memory_query_attention_mask,
+        )
+        if memory_tokens is None:
+            return delta_tokens, delta_mask
+        if memory_tokens.ndim == 2:
+            memory_tokens = memory_tokens.unsqueeze(1)
+        if memory_tokens.ndim != 3:
+            raise ValueError("memory_tokens must have shape [B, H] or [B, N, H].")
+        memory_tokens = memory_tokens.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
+        memory_tokens = _repeat_batch(memory_tokens, delta_tokens.shape[0])
+        if memory_attention_mask is None:
+            memory_attention_mask = torch.ones(
+                memory_tokens.shape[:2],
+                dtype=torch.long,
+                device=delta_mask.device,
+            )
+        else:
+            if memory_attention_mask.ndim == 1:
+                memory_attention_mask = memory_attention_mask.unsqueeze(0)
+            memory_attention_mask = _repeat_batch(memory_attention_mask, delta_tokens.shape[0])
+            memory_attention_mask = memory_attention_mask.to(device=delta_mask.device, dtype=torch.long)
+        return (
+            torch.cat([delta_tokens, memory_tokens], dim=1),
+            torch.cat([delta_mask, memory_attention_mask], dim=1),
         )
 
     @staticmethod

@@ -5,8 +5,8 @@ Each output row uses the canonical web-agent prompt format defined in
 ``jamel.train.memory.web_prompt`` (see ``docs/TRAINING.md``). Prompts
 are rebuilt from atomic columns; the upstream ``prompt`` column (which may
 contain ReAct/JSON memory blocks) is intentionally ignored. ``<think>`` is
-stripped from responses; long-term context flows through ``memory_tokens``,
-not through prompt text.
+stripped from responses; long-term context flows through learned memory
+tensors, not through prompt text.
 
 Required input columns:
     session_id, episode_idx, step_idx, target_app, start_url,
@@ -183,8 +183,13 @@ def build_dataset(args: argparse.Namespace) -> None:
 
     # ── Compress memory inputs (in session order → max cache reuse) ──────────
     memory_builder_name = str(args.memory_builder).strip().lower().replace("-", "_")
-    online_delta_state = memory_builder_name == "online_delta_state" or bool(args.online_delta_state)
-    builder_memory_name = "delta_state" if online_delta_state else memory_builder_name
+    online_delta_state = (
+        memory_builder_name in {"online_delta_state", "hybrid"}
+        or bool(args.online_delta_state)
+    )
+    builder_memory_name = memory_builder_name
+    if bool(args.online_delta_state) and memory_builder_name == "online_tokens":
+        builder_memory_name = "online_delta_state"
     builder = make_history_memory_builder(
         memory_builder=builder_memory_name,
         compressor_model_name=args.compressor_model,
@@ -207,7 +212,7 @@ def build_dataset(args: argparse.Namespace) -> None:
     if tokenizer is not None:
         tokenizer.add_eos_token = True
     print(
-        f"Memory builder: {args.memory_builder} ({MODEL_NAME if builder_memory_name == 'delta_state' else 'JAMEL'})  "
+        f"Memory builder: {args.memory_builder} ({MODEL_NAME if online_delta_state else 'JAMEL'})  "
         f"hidden_size: {builder.memory_hidden_size}  max_memory_items: {args.max_memory_items}  "
         f"delta_rank: {args.delta_rank}  delta_slots: {args.delta_memory_slots}  "
         f"online_delta_state: {online_delta_state}"
@@ -222,9 +227,16 @@ def build_dataset(args: argparse.Namespace) -> None:
                 batch_size=len(batch),
                 history_records=[s["history_records"] for s in batch],
             )
+            recent_memory_tokens = None
+            recent_memory_mask = None
+            if builder_memory_name == "hybrid":
+                recent_memory_tokens, recent_memory_mask = builder.build_recent_memory_inputs(
+                    batch_size=len(batch),
+                    history_records=[s["history_records"] for s in batch],
+                )
             current_images = [_decode_png(s["current_image_png_bytes"]) for s in batch]
             if any(image is None for image in current_images):
-                raise RuntimeError("online_delta_state requires every sample to have a current screenshot.")
+                raise RuntimeError("online DeltaState memory requires every sample to have a current screenshot.")
             current_query_tokens, current_query_mask = builder.build_current_query_inputs(
                 images=current_images,
                 texts=[args.current_query_text] * len(batch),
@@ -239,6 +251,9 @@ def build_dataset(args: argparse.Namespace) -> None:
                 row["history_memory_attention_mask"] = [1] * int(history_tokens.shape[0])
                 row["current_memory_query_tokens"] = current_query_tokens[i].tolist()
                 row["current_memory_query_attention_mask"] = current_query_mask[i].tolist()
+                if recent_memory_tokens is not None and recent_memory_mask is not None:
+                    row["memory_tokens"] = recent_memory_tokens[i].tolist()
+                    row["memory_attention_mask"] = recent_memory_mask[i].tolist()
                 finalized_rows.append(row)
         else:
             memory_tokens, memory_mask = builder.build_memory_inputs(
@@ -298,11 +313,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory-hidden-size", default="auto")
     p.add_argument(
         "--memory-builder",
-        choices=["online_tokens", "delta_state", "hybrid", "online_delta_state"],
+        choices=["online_tokens", "online_delta_state", "hybrid"],
         default="online_tokens",
         help=(
             "History compressor used to produce memory inputs. "
-            "online_delta_state stores raw history/query embeddings so DeltaState trains inside the actor."
+            "online_delta_state stores raw history/query embeddings so DeltaState trains inside the actor. "
+            "hybrid stores those online DeltaState tensors plus recent original JAMEL tokens."
         ),
     )
     p.add_argument(
@@ -322,7 +338,7 @@ def parse_args() -> argparse.Namespace:
         "--hybrid-recent-items",
         type=int,
         default=32,
-        help="For memory_builder=hybrid, append this many recent original JAMEL tokens after DeltaState tokens.",
+        help="For memory_builder=hybrid, append this many recent original JAMEL tokens after online DeltaState tokens.",
     )
     p.add_argument(
         "--max-memory-items", type=int, default=512,
