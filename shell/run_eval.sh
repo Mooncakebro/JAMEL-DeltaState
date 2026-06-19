@@ -66,7 +66,8 @@
 
 set -euo pipefail
 
-if [[ $# -gt 0 ]]; then
+EXTRA_EVAL_ARGS=()
+while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             cat <<'EOF'
@@ -98,13 +99,29 @@ Setup:
 EOF
             exit 0
             ;;
+        +model.memory_augment.max_hybrid_recent_items=*)
+            MAX_HYBRID_RECENT_ITEMS="${1#*=}"
+            shift
+            ;;
+        --max-hybrid-recent-items)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --max-hybrid-recent-items requires a value." >&2
+                exit 2
+            fi
+            MAX_HYBRID_RECENT_ITEMS="$2"
+            shift 2
+            ;;
+        --max-hybrid-recent-items=*)
+            MAX_HYBRID_RECENT_ITEMS="${1#*=}"
+            shift
+            ;;
         *)
             echo "ERROR: run_eval.sh does not accept positional arguments: $*" >&2
-            echo "Use environment variables for configuration. See: bash shell/run_eval.sh --help" >&2
+            echo "Use environment variables, --max-hybrid-recent-items, or +model.memory_augment.max_hybrid_recent_items=N." >&2
             exit 2
             ;;
     esac
-fi
+done
 
 JAMEL_ROOT=${JAMEL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 VERL_AGENT_ROOT=${VERL_AGENT_ROOT:-$(cd "$JAMEL_ROOT/third_party/verl-agent" && pwd)}
@@ -151,6 +168,7 @@ DELTA_RANK=${DELTA_RANK:-8}
 DELTA_MEMORY_SLOTS=${DELTA_MEMORY_SLOTS:-8}
 DELTA_SEED=${DELTA_SEED:-13}
 HYBRID_RECENT_ITEMS=${HYBRID_RECENT_ITEMS:-32}
+MAX_HYBRID_RECENT_ITEMS=${MAX_HYBRID_RECENT_ITEMS:-$HYBRID_RECENT_ITEMS}
 APPS_MODE=${APPS_MODE:-test10}
 SCALEWOB_ROOT=${SCALEWOB_ROOT:-"$JAMEL_ROOT/env/browser_env/scalewob-env"}
 APP_CONFIG=${APP_CONFIG:-"$JAMEL_ROOT/configs/benchmark_apps.json"}
@@ -327,7 +345,7 @@ echo "  sessions:        $NUM_SESSIONS per app"
 echo "  max_steps:       $MAX_STEPS per session (agent may reset() to start new episodes)"
 echo "  sampling:        temperature=$TEMPERATURE  top_p=$TOP_P"
 echo "  memory builder:  $MEMORY_BUILDER"
-echo "  delta state:     rank=$DELTA_RANK slots=$DELTA_MEMORY_SLOTS seed=$DELTA_SEED hybrid_recent=$HYBRID_RECENT_ITEMS"
+echo "  delta state:     rank=$DELTA_RANK slots=$DELTA_MEMORY_SLOTS seed=$DELTA_SEED hybrid_recent=$HYBRID_RECENT_ITEMS max_hybrid_recent=$MAX_HYBRID_RECENT_ITEMS"
 echo "  scalewob_root:   $SCALEWOB_ROOT"
 if [[ -n "${JAMEL_BASE_MODEL:-}" ]]; then
     echo "  base model:      $JAMEL_BASE_MODEL"
@@ -376,6 +394,7 @@ for ((w=0; w<TOTAL_WORKERS; w++)); do
         --delta-memory-slots "$DELTA_MEMORY_SLOTS" \
         --delta-seed        "$DELTA_SEED" \
         --hybrid-recent-items "$HYBRID_RECENT_ITEMS" \
+        --max-hybrid-recent-items "$MAX_HYBRID_RECENT_ITEMS" \
         --output            "$EVAL_OUTPUT" \
         --port              "$PORT" \
         --temperature       "$TEMPERATURE" \
@@ -438,6 +457,8 @@ agg = {
     'memory_builder': "$MEMORY_BUILDER",
     'delta_rank': int("$DELTA_RANK"),
     'delta_memory_slots': int("$DELTA_MEMORY_SLOTS"),
+    'hybrid_recent_items': int("$HYBRID_RECENT_ITEMS"),
+    'max_hybrid_recent_items': int("$MAX_HYBRID_RECENT_ITEMS"),
     'max_steps_per_session': $MAX_STEPS,
     'sessions_per_app': $NUM_SESSIONS,
     'total_apps': len(results),

@@ -196,3 +196,49 @@ def test_hybrid_prefix_is_online_delta_tokens_plus_recent_tokens():
     assert memory_mask.shape == (1, 3)
     assert torch.all(memory_mask == 1)
     assert torch.allclose(memory_tokens[:, -1], recent[:, 0])
+
+
+def test_hybrid_actor_clamp_keeps_last_valid_recent_tokens():
+    module = DeltaStateMemoryModule(
+        memory_hidden_size=6,
+        delta_rank=3,
+        delta_memory_slots=2,
+    )
+    history = torch.arange(1, 13, dtype=torch.float32).reshape(1, 2, 6)
+    history_mask = torch.ones((1, 2), dtype=torch.long)
+    delta_tokens, delta_mask = module.tokens_to_state_memory_batch(
+        history_tokens=history,
+        history_attention_mask=history_mask,
+    )
+    stored_recent = torch.stack(
+        [
+            torch.ones(6),
+            torch.full((6,), 2.0),
+            torch.full((6,), 3.0),
+            torch.zeros(6),
+            torch.zeros(6),
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    stored_mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.long)
+    max_recent = 2
+    trimmed_tokens = []
+    trimmed_masks = []
+    for batch_idx in range(stored_recent.shape[0]):
+        valid = stored_mask[batch_idx].to(torch.bool)
+        selected = stored_recent[batch_idx][valid][-max_recent:]
+        row = torch.zeros((max_recent, stored_recent.shape[-1]))
+        mask = torch.zeros((max_recent,), dtype=torch.long)
+        row[: selected.shape[0]] = selected
+        mask[: selected.shape[0]] = 1
+        trimmed_tokens.append(row)
+        trimmed_masks.append(mask)
+    recent = torch.stack(trimmed_tokens, dim=0)
+    recent_mask = torch.stack(trimmed_masks, dim=0)
+    memory_tokens = torch.cat([delta_tokens, recent], dim=1)
+    memory_mask = torch.cat([delta_mask, recent_mask], dim=1)
+
+    assert memory_tokens.shape == (1, 4, 6)
+    assert memory_mask.tolist() == [[1, 1, 1, 1]]
+    assert torch.allclose(memory_tokens[0, -2], torch.full((6,), 2.0))
+    assert torch.allclose(memory_tokens[0, -1], torch.full((6,), 3.0))

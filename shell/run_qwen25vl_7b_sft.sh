@@ -53,6 +53,7 @@ DELTA_RANK=${DELTA_RANK:-8}
 DELTA_MEMORY_SLOTS=${DELTA_MEMORY_SLOTS:-8}
 DELTA_SEED=${DELTA_SEED:-13}
 HYBRID_RECENT_ITEMS=${HYBRID_RECENT_ITEMS:-32}
+MAX_HYBRID_RECENT_ITEMS=${MAX_HYBRID_RECENT_ITEMS:-$HYBRID_RECENT_ITEMS}
 READ_WITH_CURRENT_QUERY=${READ_WITH_CURRENT_QUERY:-1}
 MEMORY_BUILDER_NORMALIZED=${MEMORY_BUILDER//-/_}
 if [[ -z "${ONLINE_DELTA_STATE:-}" ]]; then
@@ -160,6 +161,7 @@ torchrun \
     "+model.memory_augment.delta_rank=$DELTA_RANK" \
     "+model.memory_augment.delta_memory_slots=$DELTA_MEMORY_SLOTS" \
     "+model.memory_augment.delta_seed=$DELTA_SEED" \
+    "+model.memory_augment.max_hybrid_recent_items=$MAX_HYBRID_RECENT_ITEMS" \
     "+model.memory_augment.read_with_current_query=$READ_WITH_CURRENT_QUERY" \
     model.enable_gradient_checkpointing=${GRADIENT_CHECKPOINTING} \
     model.strategy=fsdp2 \

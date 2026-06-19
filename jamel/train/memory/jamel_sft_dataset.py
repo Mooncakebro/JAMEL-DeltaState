@@ -428,9 +428,18 @@ class JAMELMemoryVLTokenSFTDataset(Dataset):
         hidden_size = memory_tokens.shape[-1]
         padded_tokens = torch.zeros((max_items, hidden_size), dtype=memory_tokens.dtype)
         padded_mask = torch.zeros((max_items,), dtype=torch.long)
-        valid_count = min(max_items, memory_tokens.shape[0])
-        padded_tokens[:valid_count] = memory_tokens[:valid_count]
-        padded_mask[:valid_count] = memory_attention_mask[:valid_count].to(torch.long)
+        if memory_attention_mask.shape[0] == memory_tokens.shape[0]:
+            valid = memory_attention_mask.to(torch.bool)
+            selected_tokens = memory_tokens[valid]
+            selected_mask = memory_attention_mask[valid].to(torch.long)
+        else:
+            selected_tokens = memory_tokens
+            selected_mask = memory_attention_mask.to(torch.long)
+        selected_tokens = selected_tokens[-max_items:]
+        selected_mask = selected_mask[-max_items:]
+        valid_count = min(max_items, selected_tokens.shape[0])
+        padded_tokens[:valid_count] = selected_tokens[:valid_count]
+        padded_mask[:valid_count] = selected_mask[:valid_count]
         return padded_tokens, padded_mask
 
     def _pad_history_memory(self, history_tokens: torch.Tensor, history_attention_mask: torch.Tensor):

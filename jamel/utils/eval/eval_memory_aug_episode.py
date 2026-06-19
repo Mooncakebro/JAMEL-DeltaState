@@ -200,7 +200,8 @@ class MemoryAugAgent:
                  delta_rank: int = 8,
                  delta_memory_slots: int = 8,
                  delta_seed: int = 13,
-                 hybrid_recent_items: int = 32):
+                 hybrid_recent_items: int = 32,
+                 max_hybrid_recent_items: int | None = None):
         from transformers import AutoProcessor
         from jamel.train.memory.modeling import MemoryAugmentedCausalLM
         from jamel.train.memory.delta_state_encoder import MODEL_NAME, make_history_memory_builder
@@ -251,6 +252,11 @@ class MemoryAugAgent:
         self.delta_memory_slots = int(delta_memory_slots)
         self.delta_seed = int(delta_seed)
         self.hybrid_recent_items = int(hybrid_recent_items)
+        self.max_hybrid_recent_items = (
+            None if max_hybrid_recent_items is None else int(max_hybrid_recent_items)
+        )
+        if self.max_hybrid_recent_items is not None:
+            self.model.memory_augment_config["max_hybrid_recent_items"] = self.max_hybrid_recent_items
         print(f"[model] eval image size aligned to {self.model_image_size[0]}x{self.model_image_size[1]} (resize before processor)")
 
         mem_cfg_path = Path(checkpoint) / "memory_augment_config.json"
@@ -266,7 +272,8 @@ class MemoryAugAgent:
         print(
             f"[model] memory_hidden_size={self.memory_hidden_size}, memory_max_items={memory_max_items}, "
             f"memory_builder={builder_type}, delta_rank={self.delta_rank}, "
-            f"delta_slots={self.delta_memory_slots}"
+            f"delta_slots={self.delta_memory_slots}, hybrid_recent={self.hybrid_recent_items}, "
+            f"max_hybrid_recent={self.max_hybrid_recent_items}"
         )
 
         self.memory_builder = make_history_memory_builder(
@@ -588,6 +595,7 @@ def run_session(args: argparse.Namespace, agent: "MemoryAugAgent | None" = None)
             delta_memory_slots=getattr(args, "delta_memory_slots", 8),
             delta_seed=getattr(args, "delta_seed", 13),
             hybrid_recent_items=getattr(args, "hybrid_recent_items", 32),
+            max_hybrid_recent_items=getattr(args, "max_hybrid_recent_items", None),
         )
     agent.reset_session()
 
@@ -880,6 +888,7 @@ def run_all_apps(args: argparse.Namespace) -> None:
         delta_memory_slots=getattr(args, "delta_memory_slots", 8),
         delta_seed=getattr(args, "delta_seed", 13),
         hybrid_recent_items=getattr(args, "hybrid_recent_items", 32),
+        max_hybrid_recent_items=getattr(args, "max_hybrid_recent_items", None),
     )
 
     all_results = []
@@ -1013,6 +1022,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))
     p.add_argument("--delta-seed", type=int, default=int(os.environ.get("DELTA_SEED", "13")))
     p.add_argument("--hybrid-recent-items", type=int, default=int(os.environ.get("HYBRID_RECENT_ITEMS", "32")))
+    p.add_argument(
+        "--max-hybrid-recent-items",
+        type=int,
+        default=(
+            int(os.environ["MAX_HYBRID_RECENT_ITEMS"])
+            if os.environ.get("MAX_HYBRID_RECENT_ITEMS")
+            else None
+        ),
+        help="Actor-side cap for hybrid recent tokens; defaults to all built recent tokens.",
+    )
     p.add_argument("--output", default=str(_REPO_ROOT / "outputs" / "eval_trajectory"))
     p.add_argument("--device", default="cuda")
     p.add_argument("--port", type=int, default=8790, help="Local HTTP port for ScaleWoB")

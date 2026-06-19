@@ -530,9 +530,6 @@ class _MemoryAugmentedBase(nn.Module):
             self.memory_augment_config.get("max_hybrid_recent_items")
             or memory_tokens.shape[1]
         )
-        memory_tokens = memory_tokens[:, -max_recent:, :]
-        memory_tokens = memory_tokens.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
-        memory_tokens = _repeat_batch(memory_tokens, delta_tokens.shape[0])
         if memory_attention_mask is None:
             memory_attention_mask = torch.ones(
                 memory_tokens.shape[:2],
@@ -544,8 +541,28 @@ class _MemoryAugmentedBase(nn.Module):
                 memory_attention_mask = memory_attention_mask.unsqueeze(0)
             memory_attention_mask = _repeat_batch(memory_attention_mask, delta_tokens.shape[0])
             memory_attention_mask = memory_attention_mask.to(device=delta_mask.device, dtype=torch.long)
-        if memory_attention_mask.shape[1] > max_recent:
-            memory_attention_mask = memory_attention_mask[:, -max_recent:]
+        memory_tokens = memory_tokens.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
+        memory_tokens = _repeat_batch(memory_tokens, delta_tokens.shape[0])
+        if memory_tokens.shape[1] > max_recent:
+            trimmed_tokens = torch.zeros(
+                (memory_tokens.shape[0], max_recent, memory_tokens.shape[2]),
+                dtype=memory_tokens.dtype,
+                device=memory_tokens.device,
+            )
+            trimmed_mask = torch.zeros(
+                (memory_tokens.shape[0], max_recent),
+                dtype=torch.long,
+                device=memory_attention_mask.device,
+            )
+            for batch_idx in range(memory_tokens.shape[0]):
+                valid = memory_attention_mask[batch_idx].to(torch.bool)
+                selected_tokens = memory_tokens[batch_idx][valid][-max_recent:]
+                selected_count = selected_tokens.shape[0]
+                if selected_count > 0:
+                    trimmed_tokens[batch_idx, :selected_count] = selected_tokens
+                    trimmed_mask[batch_idx, :selected_count] = 1
+            memory_tokens = trimmed_tokens
+            memory_attention_mask = trimmed_mask
         return (
             torch.cat([delta_tokens, memory_tokens], dim=1),
             torch.cat([delta_mask, memory_attention_mask], dim=1),

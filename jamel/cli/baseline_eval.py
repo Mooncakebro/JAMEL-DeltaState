@@ -2009,6 +2009,7 @@ class JAMELMemoryAugAdapter:
         delta_memory_slots: int = 8,
         delta_seed: int = 13,
         hybrid_recent_items: int = 32,
+        max_hybrid_recent_items: int | None = None,
     ) -> None:
         if not checkpoint:
             raise ValueError("jamel-memory-aug requires --checkpoint")
@@ -2025,6 +2026,9 @@ class JAMELMemoryAugAdapter:
         self.delta_memory_slots = int(delta_memory_slots)
         self.delta_seed = int(delta_seed)
         self.hybrid_recent_items = int(hybrid_recent_items)
+        self.max_hybrid_recent_items = (
+            None if max_hybrid_recent_items is None else int(max_hybrid_recent_items)
+        )
         self._loaded = False
         self._history_records: list[dict[str, Any]] = []
 
@@ -2043,6 +2047,8 @@ class JAMELMemoryAugAdapter:
             dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to(self.device)
+        if self.max_hybrid_recent_items is not None:
+            self.model.memory_augment_config["max_hybrid_recent_items"] = self.max_hybrid_recent_items
         self.model.aligner = self.model.aligner.to(dtype=torch.bfloat16)
         self.model.eval()
         mem_cfg_path = Path(self.checkpoint) / "memory_augment_config.json"
@@ -2344,6 +2350,7 @@ def build_agent(
             delta_memory_slots=args.delta_memory_slots,
             delta_seed=args.delta_seed,
             hybrid_recent_items=args.hybrid_recent_items,
+            max_hybrid_recent_items=args.max_hybrid_recent_items,
         )
     raise ValueError(f"Unsupported baseline agent: {agent_name}")
 
@@ -3156,6 +3163,15 @@ def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     parser.add_argument("--delta-memory-slots", type=int, default=int(os.environ.get("DELTA_MEMORY_SLOTS", "8")))
     parser.add_argument("--delta-seed", type=int, default=int(os.environ.get("DELTA_SEED", "13")))
     parser.add_argument("--hybrid-recent-items", type=int, default=int(os.environ.get("HYBRID_RECENT_ITEMS", "32")))
+    parser.add_argument(
+        "--max-hybrid-recent-items",
+        type=int,
+        default=(
+            int(os.environ["MAX_HYBRID_RECENT_ITEMS"])
+            if os.environ.get("MAX_HYBRID_RECENT_ITEMS")
+            else None
+        ),
+    )
     parser.add_argument("--monocart-html-report", action="store_true")
     return parser
 
