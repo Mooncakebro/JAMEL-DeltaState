@@ -172,6 +172,7 @@ python -m jamel.train.memory.package_model \
 
 
 # Eval (on test10)
+```bash
 MODEL_PATH=./outputs/explorer_delta_model_merged \
 APPS_MODE=test10 \
 MAX_STEPS=50 \
@@ -181,9 +182,10 @@ WORKERS_PER_GPU=1 \
 MEMORY_BUILDER=online_delta_state \
 EVAL_OUTPUT=./outputs/eval_test10 \
 bash shell/run_eval.sh
-
+```
 
 # Eval (on 1 app, e.g. weibo)
+```bash
 MODEL_PATH=./outputs/explorer_delta_model_merged \
 APPS=weibo \
 NUM_GPUS=1 \
@@ -192,3 +194,31 @@ MAX_STEPS=20 \
 MEMORY_BUILDER=online_delta_state \
 EVAL_OUTPUT=./outputs/eval_weibo \
 bash shell/run_eval.sh
+```
+
+# Train/Eval under hybrid memory 
+```bash
+TRAIN_FILE=./data/explorer_sft_hybrid/jamel_memory_sft_train.parquet \
+VAL_FILE=./data/explorer_sft_hybrid/jamel_memory_sft_val.parquet \
+BASE_MODEL_PATH=./LLMs/Qwen2.5-VL-7B-Instruct \
+COMPRESSOR_MODEL=./LLMs/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=./outputs/explorer_hybrid8_sft_ckpt \
+OUTPUT_MODEL_PATH=./outputs/explorer_hybrid8_model \
+MEMORY_BUILDER=hybrid \
+TOTAL_EPOCHS=8 \
+NPROC_PER_NODE=8 \
+MAX_LENGTH=8192 \
+TRAIN_BATCH_SIZE=16 \
+MICRO_BATCH_SIZE_PER_GPU=1 \
+bash shell/run_qwen25vl_7b_sft.sh \
+    "+model.memory_augment.max_hybrid_recent_items=8"
+```
+
+```bash
+MODEL_PATH=./outputs/explorer_hybrid8_model \
+APPS_MODE=test10 MAX_STEPS=50 NUM_SESSIONS=1 NUM_GPUS=1 WORKERS_PER_GPU=1 \
+MEMORY_BUILDER=hybrid \
+EVAL_OUTPUT=./outputs/eval_hybrid8_test10 \
+bash shell/run_eval.sh \
+    "+model.memory_augment.max_hybrid_recent_items=8"
+```

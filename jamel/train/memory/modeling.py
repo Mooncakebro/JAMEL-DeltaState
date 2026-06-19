@@ -523,6 +523,14 @@ class _MemoryAugmentedBase(nn.Module):
             memory_tokens = memory_tokens.unsqueeze(1)
         if memory_tokens.ndim != 3:
             raise ValueError("memory_tokens must have shape [B, H] or [B, N, H].")
+        # Truncate recent tokens to max_hybrid_recent_items (default: 32).
+        # Allows preparing data with a generous number of recent items and
+        # clamping at train/eval time without re-generating the parquet.
+        max_recent = int(
+            self.memory_augment_config.get("max_hybrid_recent_items")
+            or memory_tokens.shape[1]
+        )
+        memory_tokens = memory_tokens[:, -max_recent:, :]
         memory_tokens = memory_tokens.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
         memory_tokens = _repeat_batch(memory_tokens, delta_tokens.shape[0])
         if memory_attention_mask is None:
@@ -536,6 +544,8 @@ class _MemoryAugmentedBase(nn.Module):
                 memory_attention_mask = memory_attention_mask.unsqueeze(0)
             memory_attention_mask = _repeat_batch(memory_attention_mask, delta_tokens.shape[0])
             memory_attention_mask = memory_attention_mask.to(device=delta_mask.device, dtype=torch.long)
+        if memory_attention_mask.shape[1] > max_recent:
+            memory_attention_mask = memory_attention_mask[:, -max_recent:]
         return (
             torch.cat([delta_tokens, memory_tokens], dim=1),
             torch.cat([delta_mask, memory_attention_mask], dim=1),
