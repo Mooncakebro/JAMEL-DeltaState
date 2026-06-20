@@ -206,6 +206,33 @@ if ! fc-list :lang=zh >/dev/null 2>&1 || ! fc-list :lang=zh | grep -q .; then
     echo "  fc-cache -fv" >&2
     exit 2
 fi
+if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: Node.js is not available on PATH, but eval reward scoring requires Node.js 18+." >&2
+    echo "Install/activate Node before evaluation. For nvm installs, source nvm.sh in this shell first:" >&2
+    echo "  source \"\$HOME/.nvm/nvm.sh\" && nvm use 18" >&2
+    exit 2
+fi
+NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
+if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ || "$NODE_MAJOR" -lt 18 ]]; then
+    echo "ERROR: Node.js 18+ is required for coverage scoring; found: $(node --version 2>/dev/null || echo unknown)." >&2
+    exit 2
+fi
+if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm is not available on PATH; install npm and the Monocart coverage packages." >&2
+    exit 2
+fi
+if ! node -e "require('monocart-coverage-reports'); require('monocart-locator')" >/dev/null 2>&1; then
+    NPM_GLOBAL_ROOT=$(npm root -g 2>/dev/null || true)
+    if [[ -n "$NPM_GLOBAL_ROOT" ]]; then
+        export NODE_PATH="${NODE_PATH:+$NODE_PATH:}$NPM_GLOBAL_ROOT"
+    fi
+    if ! node -e "require('monocart-coverage-reports'); require('monocart-locator')" >/dev/null 2>&1; then
+        echo "ERROR: Monocart coverage packages are not available to Node." >&2
+        echo "Install them with:" >&2
+        echo "  npm install -g monocart-coverage-reports monocart-locator" >&2
+        exit 2
+    fi
+fi
 
 "$PYTHON_BIN" - <<'PY'
 import importlib
