@@ -118,6 +118,17 @@ def _load_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     )
 
 
+def _strip_state_dict_prefix(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+) -> dict[str, torch.Tensor]:
+    return {
+        key.removeprefix(prefix): value
+        for key, value in state_dict.items()
+        if key.startswith(prefix)
+    }
+
+
 def _save_checkpoint_state_dict(
     state_dict: dict[str, torch.Tensor],
     save_directory: str | Path,
@@ -278,21 +289,26 @@ class _MemoryAugmentedBase(nn.Module):
         base_model_name_or_path: str,
         torch_dtype: str | torch.dtype | None,
         trust_remote_code: bool,
+        state_dict: Optional[dict[str, torch.Tensor]] = None,
     ) -> nn.Module:
         resolved_dtype = resolve_torch_dtype(torch_dtype)
+        load_kwargs: dict[str, Any] = {
+            "torch_dtype": resolved_dtype,
+            "trust_remote_code": trust_remote_code,
+        }
+        if state_dict is not None:
+            load_kwargs["state_dict"] = state_dict
         try:
             return AutoModelForCausalLM.from_pretrained(
                 base_model_name_or_path,
-                torch_dtype=resolved_dtype,
-                trust_remote_code=trust_remote_code,
+                **load_kwargs,
             )
         except ValueError as causal_error:
             if "Unrecognized configuration class" not in str(causal_error):
                 raise
         return AutoModelForImageTextToText.from_pretrained(
             base_model_name_or_path,
-            torch_dtype=resolved_dtype,
-            trust_remote_code=trust_remote_code,
+            **load_kwargs,
         )
 
     @classmethod
@@ -305,8 +321,10 @@ class _MemoryAugmentedBase(nn.Module):
         config=None,
         torch_dtype: str | torch.dtype | None = None,
         trust_remote_code: bool = True,
-        **_: Any,
+        **kwargs: Any,
     ):
+        if torch_dtype is None:
+            torch_dtype = kwargs.get("dtype")
         memory_augment_config = memory_augment_config or {}
         checkpoint_path = Path(pretrained_model_name_or_path)
         metadata: dict[str, Any] = {}
@@ -327,7 +345,12 @@ class _MemoryAugmentedBase(nn.Module):
         if resolved_hidden_size is None and config is not None:
             resolved_hidden_size = getattr(config, "memory_hidden_size", None)
 
-        if metadata and _is_self_contained_checkpoint(checkpoint_path):
+        self_contained_checkpoint = bool(metadata and _is_self_contained_checkpoint(checkpoint_path))
+        checkpoint_state_dict: dict[str, torch.Tensor] | None = None
+        backbone_state_dict: dict[str, torch.Tensor] | None = None
+        if self_contained_checkpoint:
+            checkpoint_state_dict = _load_checkpoint_state_dict(checkpoint_path)
+            backbone_state_dict = _strip_state_dict_prefix(checkpoint_state_dict, "llm.")
             base_model_name_or_path = str(checkpoint_path)
         else:
             base_model_name_or_path = _resolve_local_model_path(
@@ -339,11 +362,17 @@ class _MemoryAugmentedBase(nn.Module):
             memory_hidden_size=resolved_hidden_size,
             torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
+            llm=cls._load_backbone(
+                base_model_name_or_path=base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+                state_dict=backbone_state_dict,
+            ) if backbone_state_dict else None,
             memory_augment_config=memory_augment_config,
         )
 
         if metadata:
-            state_dict = _load_checkpoint_state_dict(checkpoint_path)
+            state_dict = checkpoint_state_dict or _load_checkpoint_state_dict(checkpoint_path)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             allowed_missing_suffixes = {"lm_head.weight"}
             unexpected_keys = [key for key in unexpected_keys if not key.startswith("_metadata")]
